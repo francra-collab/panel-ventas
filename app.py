@@ -1,9 +1,11 @@
-import streamlit as st
-import pandas as pd
-import requests
-import io
 import base64
-import hashlib
+import io
+import textwrap
+
+import pandas as pd
+import plotly.graph_objects as go
+import requests
+import streamlit as st
 
 # ============================================================
 # CONFIGURACIÓN
@@ -31,6 +33,15 @@ COLUMNAS_REQUERIDAS = [
     "Forma Pago",
 ]
 
+COLUMNAS_OPCIONALES = [
+    "TC",
+    "Suc.",
+    "Nº Comprobante",
+    "Lista Utilizada",
+    "Porcentaje Comisión",
+    "Monto Comisión",
+]
+
 COLUMNAS_NUMERICAS = [
     "Cantidad",
     "Precio Costo",
@@ -45,29 +56,121 @@ COLUMNAS_TEXTO = [
     "Articulo",
     "Cliente",
     "Forma Pago",
+    "TC",
+    "Suc.",
+    "Nº Comprobante",
+    "Lista Utilizada",
 ]
 
+# Columnas que se guardan en el histórico (todo lo demás se recalcula al cargar)
+COLUMNAS_GUARDAR = COLUMNAS_REQUERIDAS + COLUMNAS_OPCIONALES + ["_Clave"]
+
+DIAS_SEMANA = {
+    0: "Lunes",
+    1: "Martes",
+    2: "Miércoles",
+    3: "Jueves",
+    4: "Viernes",
+    5: "Sábado",
+    6: "Domingo",
+}
+
+# Paleta de los gráficos
+AZUL = "#2563EB"
+VERDE = "#16A34A"
+ROJO = "#DC2626"
+NARANJA = "#F59E0B"
+GRIS = "#64748B"
+PALETA = [AZUL, VERDE, NARANJA, "#7C3AED", "#0891B2", ROJO, GRIS]
+
+# Los gráficos no son interactivos con la rueda del mouse, así que
+# al scrollear la página no se mueven ni se achican.
+CONFIG_GRAFICO = {
+    "displayModeBar": False,
+    "scrollZoom": False,
+    "doubleClick": False,
+    "responsive": True,
+}
+
+st.markdown(
+    """
+    <style>
+        .block-container {padding-top: 2rem; padding-bottom: 3rem;}
+        [data-testid="stMetricValue"] {font-size: 1.55rem;}
+        [data-testid="stMetricLabel"] p {font-size: 0.9rem; color: #64748B;}
+        div[data-testid="stMetric"] {
+            background: #F8FAFC;
+            border: 1px solid #E2E8F0;
+            border-radius: 12px;
+            padding: 14px 16px;
+        }
+        div[data-testid="stPlotlyChart"] {width: 100%;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
 # ============================================================
-# FUNCIONES GENERALES
+# FORMATO (estilo argentino: 1.234,56 y dd/mm/aaaa)
+# ============================================================
+
+def formato_numero(valor, decimales=2):
+    try:
+        if pd.isna(valor):
+            valor = 0
+        texto = f"{float(valor):,.{decimales}f}"
+    except (ValueError, TypeError):
+        texto = f"{0:,.{decimales}f}"
+    return texto.replace(",", "§").replace(".", ",").replace("§", ".")
+
+
+def formato_pesos(valor):
+    try:
+        valor = 0.0 if pd.isna(valor) else float(valor)
+    except (ValueError, TypeError):
+        valor = 0.0
+    signo = "-" if valor < 0 else ""
+    return f"{signo}$ {formato_numero(abs(valor), 2)}"
+
+
+def formato_entero(valor):
+    return formato_numero(valor, 0)
+
+
+def formato_porcentaje(valor):
+    return f"{formato_numero(valor, 2)} %"
+
+
+def formato_fecha(serie):
+    return pd.to_datetime(serie, errors="coerce").dt.strftime("%d/%m/%Y")
+
+
+# ============================================================
+# LECTURA Y LIMPIEZA
 # ============================================================
 
 def numero(valor):
-    """Convierte números argentinos y números normales a float."""
-    if pd.isna(valor):
+    """Convierte números argentinos (1.234,56) y normales a float."""
+    if valor is None or (not isinstance(valor, str) and pd.isna(valor)):
         return 0.0
 
-    texto = str(valor).strip()
+    if isinstance(valor, (int, float)):
+        return float(valor)
 
-    if texto == "":
+    texto = str(valor).strip().replace("$", "").replace(" ", "")
+
+    if texto in ("", "nan", "None", "-"):
         return 0.0
-
-    texto = texto.replace("$", "").replace(" ", "")
 
     try:
         if "." in texto and "," in texto:
             texto = texto.replace(".", "").replace(",", ".")
         elif "," in texto:
             texto = texto.replace(",", ".")
+        elif texto.count(".") > 1:
+            # 1.234.567 → miles
+            texto = texto.replace(".", "")
         return float(texto)
     except (ValueError, TypeError):
         return 0.0
@@ -76,198 +179,259 @@ def numero(valor):
 def limpiar_columnas(df):
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
+    df = df.loc[:, [c for c in df.columns if not c.startswith("Unnamed")]]
     df = df.dropna(axis=1, how="all")
     return df
 
 
 def leer_infoventas(archivo):
-    """Intenta leer XLSX/XLS y, si no funciona, TXT/CSV."""
+    """
+    Lee el INFOVENTAS. Aunque se llame .xls, el sistema suele exportar
+    un texto separado por tabulaciones, así que detectamos el formato real.
+    """
     contenido = archivo.getvalue()
-    nombre = str(getattr(archivo, "name", "")).lower()
 
-    if nombre.endswith((".xlsx", ".xls", ".xlsm")):
-        for kwargs in (
-            {"engine": "openpyxl"},
-            {"engine": "xlrd"},
-        ):
+    es_excel_real = contenido[:4] in (b"PK\x03\x04", b"\xd0\xcf\x11\xe0")
+
+    if es_excel_real:
+        for motor in ("openpyxl", "xlrd"):
             try:
-                df = pd.read_excel(io.BytesIO(contenido), **kwargs)
+                df = pd.read_excel(
+                    io.BytesIO(contenido),
+                    engine=motor,
+                    dtype=str,
+                )
                 df = limpiar_columnas(df)
                 if len(df.columns) > 3:
                     return df
             except Exception:
                 pass
 
-    try:
-        df = pd.read_excel(io.BytesIO(contenido))
-        df = limpiar_columnas(df)
-        if len(df.columns) > 3:
-            return df
-    except Exception:
-        pass
-
-    for encoding in ("cp1252", "latin1", "utf-8-sig", "utf-8"):
-        try:
-            df = pd.read_csv(
-                io.BytesIO(contenido),
-                sep="\t",
-                encoding=encoding,
-            )
-            df = limpiar_columnas(df)
-            if len(df.columns) > 3:
-                return df
-        except Exception:
-            pass
-
-    for encoding in ("cp1252", "latin1", "utf-8-sig", "utf-8"):
-        try:
-            df = pd.read_csv(
-                io.BytesIO(contenido),
-                encoding=encoding,
-            )
-            df = limpiar_columnas(df)
-            if len(df.columns) > 3:
-                return df
-        except Exception:
-            pass
+    for separador in ("\t", ";", ","):
+        for encoding in ("cp1252", "latin1", "utf-8-sig", "utf-8"):
+            try:
+                df = pd.read_csv(
+                    io.BytesIO(contenido),
+                    sep=separador,
+                    encoding=encoding,
+                    dtype=str,
+                )
+                df = limpiar_columnas(df)
+                if len(df.columns) > 3:
+                    return df
+            except Exception:
+                pass
 
     raise ValueError(
         "No pude reconocer el archivo. "
-        "Probá con el Excel original de INFOVENTAS (.xls o .xlsx)."
+        "Probá con el archivo original de INFOVENTAS."
     )
 
 
-def preparar_datos(df):
+def parsear_fecha(serie):
+    """Fechas dd/mm/aaaa primero; si no, cualquier otro formato (ISO, Excel)."""
+    serie = serie.astype(str).str.strip()
+    fecha = pd.to_datetime(serie, format="%d/%m/%Y", errors="coerce")
+    resto = fecha.isna()
+    if resto.any():
+        fecha.loc[resto] = pd.to_datetime(
+            serie[resto],
+            errors="coerce",
+        )
+    return fecha
+
+
+def normalizar_comprobante(serie):
+    return (
+        serie.fillna("")
+        .astype(str)
+        .str.strip()
+        .str.replace(r"\.0$", "", regex=True)
+        .str.lstrip("0")
+    )
+
+
+def agregar_clave(df):
+    """
+    Clave única por renglón: sirve para no cargar dos veces lo mismo.
+    Dos renglones realmente idénticos se distinguen con un contador,
+    así que re-subir un archivo no duplica nada y no depende del orden.
+    """
+    base = (
+        pd.to_datetime(df["Fecha"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
+        + "|" + df["TC"].fillna("").astype(str).str.strip()
+        + "|" + normalizar_comprobante(df["Nº Comprobante"])
+        + "|" + df["Cod"].fillna("").astype(str).str.strip()
+        + "|" + df["Cliente"].fillna("").astype(str).str.strip()
+        + "|" + df["Cantidad"].round(2).astype(str)
+        + "|" + df["Total Venta"].round(2).astype(str)
+        + "|" + df["Total Costo"].round(2).astype(str)
+    )
+    contador = base.groupby(base).cumcount().astype(str)
+    df["_Clave"] = base + "#" + contador
+    return df
+
+
+def preparar_columnas_base(df):
+    """Deja el dataframe con tipos correctos (sirve para archivo nuevo e histórico)."""
     df = limpiar_columnas(df)
 
-    faltantes = [
-        c for c in COLUMNAS_REQUERIDAS
-        if c not in df.columns
-    ]
-
+    faltantes = [c for c in COLUMNAS_REQUERIDAS if c not in df.columns]
     if faltantes:
         raise ValueError(
-            "Faltan columnas obligatorias: "
-            + ", ".join(faltantes)
+            "Faltan columnas obligatorias: " + ", ".join(faltantes)
         )
 
-    df["Fecha"] = pd.to_datetime(
-        df["Fecha"],
-        dayfirst=True,
-        errors="coerce",
-    )
+    for columna in COLUMNAS_OPCIONALES:
+        if columna not in df.columns:
+            df[columna] = ""
 
-    if df["Fecha"].isna().sum() == len(df):
+    df["Fecha"] = parsear_fecha(df["Fecha"])
+    df = df[df["Fecha"].notna()].copy()
+
+    if df.empty:
         raise ValueError(
-            "No pude reconocer ninguna fecha de la columna 'Fecha'."
+            "No pude reconocer ninguna fecha en la columna 'Fecha'."
         )
 
     for columna in COLUMNAS_NUMERICAS:
         df[columna] = df[columna].apply(numero)
 
     for columna in COLUMNAS_TEXTO:
-        df[columna] = (
-            df[columna]
-            .fillna("")
-            .astype(str)
-            .str.strip()
-        )
+        df[columna] = df[columna].fillna("").astype(str).str.strip()
 
-    for columna in [
-        "TC",
-        "Suc.",
-        "Nº Comprobante",
-        "Lista Utilizada",
-        "Porcentaje Comisión",
-        "Monto Comisión",
-    ]:
-        if columna not in df.columns:
-            df[columna] = ""
+    return df.reset_index(drop=True)
 
-    # Precio real por unidad
+
+def clasificar_pago(serie):
+    """CONTADO / CUENTA CORRIENTE / OTRO (tolera 'CORRENTE', 'CTA CTE', etc.)."""
+    forma = serie.fillna("").astype(str).str.upper()
+
+    tipo = pd.Series("OTRO", index=serie.index)
+    tipo[forma.str.contains("CONTADO", na=False)] = "CONTADO"
+    tipo[
+        forma.str.contains(r"CUENTA\s+COR+[EI]NTE|CTA\.?\s*CTE|CTA\.?\s*CORR", regex=True, na=False)
+    ] = "CUENTA CORRIENTE"
+    return tipo
+
+
+def enriquecer(df):
+    """
+    Calcula todo lo derivado. Se aplica SIEMPRE sobre el histórico completo,
+    así los datos viejos también quedan corregidos.
+
+    Claves del arreglo de "valores raros / negativos":
+    - INFOVENTAS informa la Cantidad SIEMPRE positiva, incluso en notas de
+      crédito (devoluciones, saldos cancelados). Los importes sí vienen en
+      negativo. Antes se sumaban las unidades de las NC como si fueran
+      ventas y el precio unitario salía mal.
+    - Acá se detectan las devoluciones y se les pone cantidad negativa.
+    - La rentabilidad se calcula ponderada por importes, no como promedio
+      de porcentajes (los renglones de NC traen 0 % y arruinaban el promedio).
+    """
+    df = df.copy()
+
+    df["Forma Pago"] = (
+        df["Forma Pago"]
+        .str.upper()
+        .str.replace("CORRENTE", "CORRIENTE", regex=False)
+    )
+    df["Tipo Pago"] = clasificar_pago(df["Forma Pago"])
+
+    tc = df["TC"].str.upper().str.strip()
+    df["Es Devolucion"] = (
+        tc.str.startswith("NC")
+        | (df["Total Venta"] < 0)
+        | (df["Total Costo"] < 0)
+    )
+
+    signo = df["Es Devolucion"].map({True: -1.0, False: 1.0})
+    df["Cantidad Neta"] = df["Cantidad"].abs() * signo
+    df["Tipo Operacion"] = df["Es Devolucion"].map(
+        {True: "Devolución / Nota de crédito", False: "Venta"}
+    )
+
+    df["Comprobante"] = (
+        df["TC"].str.strip() + " " + normalizar_comprobante(df["Nº Comprobante"])
+    ).str.strip()
+
     df["Precio Unitario"] = 0.0
     mascara = df["Cantidad"] != 0
     df.loc[mascara, "Precio Unitario"] = (
-        df.loc[mascara, "Total Venta"]
-        / df.loc[mascara, "Cantidad"]
+        df.loc[mascara, "Total Venta"].abs() / df.loc[mascara, "Cantidad"].abs()
     )
 
-    # Este cálculo es independiente de la columna
-    # Rentabilidad (%) que ya viene en INFOVENTAS.
-    df["Resultado Venta-Costo $"] = (
-        df["Total Venta"] - df["Total Costo"]
+    df["Resultado Venta-Costo $"] = df["Total Venta"] - df["Total Costo"]
+
+    df["Rentabilidad Real"] = 0.0
+    con_costo = df["Total Costo"] != 0
+    df.loc[con_costo, "Rentabilidad Real"] = (
+        df.loc[con_costo, "Resultado Venta-Costo $"]
+        / df.loc[con_costo, "Total Costo"]
+        * 100
     )
 
-    # Agrupación solicitada: contado / cuenta corriente / otro
-    forma = df["Forma Pago"].str.upper()
-
-    df["Tipo Pago"] = "OTRO"
-
-    df.loc[
-        forma.str.contains("CONTADO", na=False),
-        "Tipo Pago"
-    ] = "CONTADO"
-
-    df.loc[
-        forma.str.contains("CUENTA CORRIENTE", na=False),
-        "Tipo Pago"
-    ] = "CUENTA CORRIENTE"
-
-    df["Dia"] = df["Fecha"].dt.date.astype(str)
-
-    # Número de fila original para distinguir dos renglones iguales.
-    df["_FilaArchivo"] = range(1, len(df) + 1)
-
-    # Firma de fila para evitar volver a cargar exactamente
-    # el mismo renglón del mismo archivo.
-    columnas_firma = [
-        "Fecha",
-        "Cod",
-        "Articulo",
-        "Cantidad",
-        "Cliente",
-        "Total Venta",
-        "Total Costo",
-        "Nº Comprobante",
-        "_FilaArchivo",
-    ]
-
-    def firma_fila(fila):
-        partes = []
-
-        for columna in columnas_firma:
-            valor = fila.get(columna, "")
-
-            if isinstance(valor, pd.Timestamp):
-                valor = valor.isoformat()
-
-            partes.append(str(valor))
-
-        texto = "|".join(partes)
-
-        return hashlib.sha256(
-            texto.encode("utf-8")
-        ).hexdigest()
-
-    df["_FirmaFila"] = df.apply(
-        firma_fila,
-        axis=1,
-    )
-
-    # ID compatible con el histórico anterior.
-    df["ID Operacion"] = (
-        df["Fecha"].astype(str)
-        + "|"
-        + df["Cod"]
-        + "|"
-        + df["Cliente"]
-        + "|"
-        + df["Total Venta"].round(2).astype(str)
-        + "|"
-        + df["Cantidad"].round(2).astype(str)
-    )
+    df["Dia"] = df["Fecha"].dt.normalize()
 
     return df
+
+
+def preparar_datos(df):
+    df = preparar_columnas_base(df)
+    df = agregar_clave(df)
+    return df
+
+
+# ============================================================
+# MÉTRICAS (todas ponderadas por importes)
+# ============================================================
+
+def rentabilidad_ponderada(df):
+    """Resultado / Costo (igual criterio que la columna Rentabilidad de INFOVENTAS)."""
+    costo = df["Total Costo"].sum()
+    if costo == 0:
+        return 0.0
+    return df["Resultado Venta-Costo $"].sum() / costo * 100
+
+
+def margen_sobre_venta(df):
+    venta = df["Total Venta"].sum()
+    if venta == 0:
+        return 0.0
+    return df["Resultado Venta-Costo $"].sum() / venta * 100
+
+
+def resumen_por(df, columnas):
+    """Agrupa y calcula ventas, devoluciones y neto de forma consistente."""
+    ventas = df[~df["Es Devolucion"]]
+    devol = df[df["Es Devolucion"]]
+
+    g_total = df.groupby(columnas, dropna=False)
+    base = g_total.agg(
+        Venta_Neta=("Total Venta", "sum"),
+        Costo_Neto=("Total Costo", "sum"),
+        Resultado=("Resultado Venta-Costo $", "sum"),
+        Unidades=("Cantidad Neta", "sum"),
+        Renglones=("Cantidad", "size"),
+    )
+
+    ventas_brutas = (
+        ventas.groupby(columnas, dropna=False)["Total Venta"].sum().rename("Ventas_Brutas")
+    )
+    devoluciones = (
+        devol.groupby(columnas, dropna=False)["Total Venta"].sum().rename("Devoluciones")
+    )
+
+    out = base.join(ventas_brutas, how="left").join(devoluciones, how="left")
+    out[["Ventas_Brutas", "Devoluciones"]] = out[["Ventas_Brutas", "Devoluciones"]].fillna(0.0)
+
+    out["Rentabilidad"] = 0.0
+    con_costo = out["Costo_Neto"] != 0
+    out.loc[con_costo, "Rentabilidad"] = (
+        out.loc[con_costo, "Resultado"] / out.loc[con_costo, "Costo_Neto"] * 100
+    )
+
+    return out.reset_index()
 
 
 # ============================================================
@@ -277,13 +441,8 @@ def preparar_datos(df):
 def github_configurado():
     try:
         return all(
-            clave in st.secrets
-            and str(st.secrets[clave]).strip() != ""
-            for clave in (
-                "GITHUB_TOKEN",
-                "GITHUB_REPO",
-                "GITHUB_USER",
-            )
+            clave in st.secrets and str(st.secrets[clave]).strip() != ""
+            for clave in ("GITHUB_TOKEN", "GITHUB_REPO", "GITHUB_USER")
         )
     except Exception:
         return False
@@ -291,9 +450,7 @@ def github_configurado():
 
 def github_headers():
     return {
-        "Authorization": (
-            f"Bearer {st.secrets['GITHUB_TOKEN']}"
-        ),
+        "Authorization": f"Bearer {st.secrets['GITHUB_TOKEN']}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
@@ -308,84 +465,67 @@ def github_url():
     )
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def _leer_historial_github(_firma_config):
+    """Se cachea 10 minutos para no consultar GitHub en cada click."""
+    respuesta = requests.get(github_url(), headers=github_headers(), timeout=20)
+
+    if respuesta.status_code == 404:
+        return pd.DataFrame()
+
+    respuesta.raise_for_status()
+    datos = respuesta.json()
+
+    if "content" not in datos:
+        # Archivos de más de 1 MB: GitHub no devuelve el contenido inline
+        descarga = requests.get(
+            datos["download_url"], headers=github_headers(), timeout=30
+        )
+        descarga.raise_for_status()
+        contenido = descarga.content
+    else:
+        contenido = base64.b64decode(datos["content"])
+
+    return pd.read_csv(io.BytesIO(contenido), dtype=str)
+
+
 def cargar_historial():
     if not github_configurado():
         return pd.DataFrame()
 
     try:
-        respuesta = requests.get(
-            github_url(),
-            headers=github_headers(),
-            timeout=20,
-        )
+        crudo = _leer_historial_github(st.secrets["GITHUB_REPO"])
 
-        if respuesta.status_code == 404:
+        if crudo.empty:
             return pd.DataFrame()
 
-        respuesta.raise_for_status()
-
-        datos = respuesta.json()
-
-        if "content" not in datos:
-            return pd.DataFrame()
-
-        contenido = base64.b64decode(
-            datos["content"]
-        )
-
-        df = pd.read_csv(
-            io.BytesIO(contenido)
-        )
-
-        if "Fecha" in df.columns:
-            df["Fecha"] = pd.to_datetime(
-                df["Fecha"],
-                errors="coerce",
-            )
-
-        return df
+        df = preparar_columnas_base(crudo)
+        # Se recalcula la clave sobre todo el histórico: así los datos
+        # guardados con versiones anteriores también quedan deduplicados.
+        return agregar_clave(df)
 
     except Exception as e:
-        st.error(
-            "No se pudo leer el historial de GitHub. "
-            f"Detalle: {e}"
-        )
+        st.error(f"No se pudo leer el historial de GitHub. Detalle: {e}")
         return pd.DataFrame()
 
 
 def guardar_historial(df):
     if not github_configurado():
-        st.error(
-            "GitHub no está configurado en los Secrets de Streamlit."
-        )
+        st.error("GitHub no está configurado en los Secrets de Streamlit.")
         return False
 
     try:
-        df_guardar = df.copy()
-
-        if "Fecha" in df_guardar.columns:
-            df_guardar = df_guardar.sort_values(
-                "Fecha",
-                ascending=True,
-                na_position="last",
-            )
-
-        contenido_csv = df_guardar.to_csv(
-            index=False
-        ).encode("utf-8")
-
-        contenido_base64 = base64.b64encode(
-            contenido_csv
-        ).decode("utf-8")
-
-        respuesta = requests.get(
-            github_url(),
-            headers=github_headers(),
-            timeout=20,
+        df_guardar = df[[c for c in COLUMNAS_GUARDAR if c in df.columns]].copy()
+        df_guardar = df_guardar.sort_values(
+            "Fecha", ascending=True, na_position="last", kind="stable"
         )
 
-        sha = None
+        contenido_csv = df_guardar.to_csv(index=False).encode("utf-8")
+        contenido_base64 = base64.b64encode(contenido_csv).decode("utf-8")
 
+        respuesta = requests.get(github_url(), headers=github_headers(), timeout=20)
+
+        sha = None
         if respuesta.status_code == 200:
             sha = respuesta.json().get("sha")
         elif respuesta.status_code != 404:
@@ -396,38 +536,124 @@ def guardar_historial(df):
             "content": contenido_base64,
             "branch": "main",
         }
-
         if sha:
             datos["sha"] = sha
 
         respuesta = requests.put(
-            github_url(),
-            headers=github_headers(),
-            json=datos,
-            timeout=60,
+            github_url(), headers=github_headers(), json=datos, timeout=60
         )
-
         respuesta.raise_for_status()
 
+        _leer_historial_github.clear()
         return True
 
     except Exception as e:
-        st.error(
-            "No se pudo guardar el historial en GitHub. "
-            f"Detalle: {e}"
-        )
+        st.error(f"No se pudo guardar el historial en GitHub. Detalle: {e}")
         return False
 
 
 # ============================================================
-# PRESENTACIÓN
+# GRÁFICOS (Plotly, tamaño fijo)
 # ============================================================
 
-def formato_pesos(valor):
-    try:
-        return f"$ {float(valor):,.2f}"
-    except Exception:
-        return "$ 0.00"
+def _layout_base(fig, titulo, alto):
+    fig.update_layout(
+        title=dict(text=f"<b>{titulo}</b>", x=0, xanchor="left", font=dict(size=17)),
+        height=alto,
+        autosize=True,
+        template="plotly_white",
+        separators=",.",  # decimales con coma, miles con punto
+        font=dict(family="Inter, Segoe UI, Arial, sans-serif", size=13, color="#0F172A"),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=10, r=30, t=60, b=40),
+        dragmode=False,
+        hoverlabel=dict(bgcolor="white", font_size=13),
+        legend=dict(orientation="h", y=-0.15, x=0),
+    )
+    return fig
+
+
+def etiqueta_articulo(cod, descripcion, ancho=48):
+    """Código en negrita y descripción en varias líneas HORIZONTALES."""
+    lineas = textwrap.wrap(
+        str(descripcion), width=ancho, max_lines=3, placeholder="…"
+    ) or ["-"]
+    return f"<b>{cod}</b><br>" + "<br>".join(lineas)
+
+
+def etiqueta_texto(texto, ancho=40):
+    lineas = textwrap.wrap(str(texto), width=ancho, max_lines=2, placeholder="…") or ["-"]
+    return "<br>".join(lineas)
+
+
+def grafico_barras_horizontal(etiquetas, valores, titulo, formato, color=AZUL, alto_por_barra=58):
+    valores = list(valores)
+    textos = [formato(v) for v in valores]
+    n = len(valores)
+    maximo = max([abs(v) for v in valores] + [1])
+    minimo = min(valores + [0])
+
+    colores = [color if v >= 0 else ROJO for v in valores]
+
+    fig = go.Figure(
+        go.Bar(
+            x=valores,
+            y=list(etiquetas),
+            orientation="h",
+            text=textos,
+            textposition="outside",
+            cliponaxis=False,
+            marker=dict(color=colores, line=dict(width=0)),
+            hovertemplate="%{y}<br><b>%{text}</b><extra></extra>",
+        )
+    )
+
+    fig = _layout_base(fig, titulo, max(380, alto_por_barra * n + 120))
+    fig.update_layout(bargap=0.35, showlegend=False)
+    fig.update_xaxes(
+        range=[minimo * 1.3 if minimo < 0 else 0, maximo * 1.3],
+        tickformat=",.0f",
+        showgrid=True,
+        gridcolor="#E2E8F0",
+        zeroline=True,
+        zerolinecolor="#94A3B8",
+        fixedrange=True,
+    )
+    fig.update_yaxes(
+        autorange="reversed",  # el puesto 1 arriba
+        automargin=True,
+        fixedrange=True,
+        tickfont=dict(size=12),
+    )
+    return fig
+
+
+def grafico_dona(etiquetas, valores, titulo):
+    fig = go.Figure(
+        go.Pie(
+            labels=list(etiquetas),
+            values=list(valores),
+            hole=0.55,
+            sort=False,
+            marker=dict(colors=PALETA, line=dict(color="white", width=2)),
+            textinfo="percent",
+            textfont=dict(size=14),
+            hovertemplate="<b>%{label}</b><br>%{value:,.2f}<br>%{percent}<extra></extra>",
+        )
+    )
+    fig = _layout_base(fig, titulo, 400)
+    fig.update_layout(legend=dict(orientation="h", y=-0.05, x=0.5, xanchor="center"))
+    return fig
+
+
+def mostrar_grafico(fig, clave):
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        config=CONFIG_GRAFICO,
+        key=clave,
+    )
 
 
 # ============================================================
@@ -435,22 +661,13 @@ def formato_pesos(valor):
 # ============================================================
 
 st.title("📊 Panel de Ventas")
-
-st.caption(
-    "INFOVENTAS — análisis diario e histórico"
-)
+st.caption("INFOVENTAS — análisis diario e histórico")
 
 # ============================================================
 # CARGAR HISTORIAL
 # ============================================================
 
 historial = cargar_historial()
-
-if not historial.empty:
-    historial["Fecha"] = pd.to_datetime(
-        historial["Fecha"],
-        errors="coerce",
-    )
 
 # ============================================================
 # SUBIR ARCHIVO
@@ -460,158 +677,60 @@ st.subheader("📁 Cargar INFOVENTAS")
 
 archivo = st.file_uploader(
     "Subí el INFOVENTAS del día",
-    type=[
-        "xlsx",
-        "xls",
-        "xlsm",
-        "csv",
-        "txt",
-    ],
+    type=["xlsx", "xls", "xlsm", "csv", "txt"],
 )
 
 if archivo is not None:
-
     try:
-        df_nuevo = leer_infoventas(
-            archivo
+        df_nuevo = preparar_datos(leer_infoventas(archivo))
+
+        st.success(f"Archivo leído correctamente: {len(df_nuevo):,} filas.".replace(",", "."))
+
+        fechas_archivo = sorted(df_nuevo["Fecha"].dt.date.unique())
+        st.info(
+            "Fecha/s detectada/s: "
+            + ", ".join(f.strftime("%d/%m/%Y") for f in fechas_archivo)
         )
 
-        df_nuevo = preparar_datos(
-            df_nuevo
-        )
-
-        st.success(
-            f"Archivo leído correctamente: "
-            f"{len(df_nuevo):,} filas."
-        )
-
-        fechas_archivo = sorted(
-            df_nuevo["Fecha"]
-            .dropna()
-            .dt.date
-            .unique()
-        )
-
-        if fechas_archivo:
+        n_dev = int(enriquecer(df_nuevo)["Es Devolucion"].sum())
+        if n_dev:
             st.info(
-                "Fecha/s detectada/s: "
-                + ", ".join(
-                    str(f)
-                    for f in fechas_archivo
-                )
+                f"🔁 El archivo tiene {n_dev} renglones de notas de crédito / "
+                "devoluciones. Se restan de las ventas."
             )
-
-        # ====================================================
-        # GUARDADO AUTOMÁTICO
-        # ====================================================
 
         if not github_configurado():
-
             st.warning(
                 "⚠️ GitHub no está configurado en los Secrets. "
-                "El dashboard funciona, pero todavía no "
-                "guardará el histórico."
+                "El panel funciona, pero todavía no guardará el histórico."
             )
-
         else:
-
             if historial.empty:
-
                 df_para_agregar = df_nuevo.copy()
-
-            elif "_FirmaFila" in historial.columns:
-
-                firmas_existentes = set(
-                    historial["_FirmaFila"]
-                    .dropna()
-                    .astype(str)
-                )
-
-                df_para_agregar = df_nuevo[
-                    ~df_nuevo["_FirmaFila"].isin(
-                        firmas_existentes
-                    )
-                ].copy()
-
             else:
-
-                ids_existentes = set(
-                    historial.get(
-                        "ID Operacion",
-                        pd.Series(dtype=str),
-                    )
-                    .dropna()
-                    .astype(str)
-                )
-
-                df_para_agregar = df_nuevo[
-                    ~df_nuevo["ID Operacion"].isin(
-                        ids_existentes
-                    )
-                ].copy()
+                existentes = set(historial["_Clave"])
+                df_para_agregar = df_nuevo[~df_nuevo["_Clave"].isin(existentes)].copy()
 
             if not df_para_agregar.empty:
-
-                with st.spinner(
-                    "Guardando automáticamente en el histórico..."
-                ):
-
+                with st.spinner("Guardando automáticamente en el histórico..."):
                     historial_actualizado = pd.concat(
-                        [
-                            historial,
-                            df_para_agregar,
-                        ],
-                        ignore_index=True,
-                    )
+                        [historial, df_para_agregar], ignore_index=True
+                    ).drop_duplicates(subset=["_Clave"], keep="first")
 
-                    if "_FirmaFila" in historial_actualizado.columns:
-
-                        historial_actualizado = (
-                            historial_actualizado
-                            .drop_duplicates(
-                                subset=["_FirmaFila"],
-                                keep="first",
-                            )
-                        )
-
-                    elif "ID Operacion" in historial_actualizado.columns:
-
-                        historial_actualizado = (
-                            historial_actualizado
-                            .drop_duplicates(
-                                subset=["ID Operacion"],
-                                keep="first",
-                            )
-                        )
-
-                    if guardar_historial(
-                        historial_actualizado
-                    ):
-
-                        historial = (
-                            historial_actualizado
-                        )
-
+                    if guardar_historial(historial_actualizado):
+                        historial = historial_actualizado
                         st.success(
-                            f"✅ Guardado automático: "
-                            f"{len(df_para_agregar):,} "
-                            f"filas nuevas."
+                            "✅ Guardado automático: "
+                            f"{len(df_para_agregar):,} filas nuevas.".replace(",", ".")
                         )
-
             else:
-
                 st.info(
-                    "ℹ️ Este archivo ya está cargado "
-                    "en el histórico. No se agregaron duplicados."
+                    "ℹ️ Este archivo ya está cargado en el histórico. "
+                    "No se agregaron duplicados."
                 )
 
     except Exception as e:
-
-        st.error(
-            "❌ Error procesando el archivo: "
-            f"{e}"
-        )
-
+        st.error(f"❌ Error procesando el archivo: {e}")
         st.stop()
 
 # ============================================================
@@ -619,61 +738,10 @@ if archivo is not None:
 # ============================================================
 
 if historial.empty:
-
-    st.info(
-        "Subí un INFOVENTAS para comenzar."
-    )
-
+    st.info("Subí un INFOVENTAS para comenzar.")
     st.stop()
 
-# ============================================================
-# PREPARAR DATASET
-# ============================================================
-
-df = historial.copy()
-
-df["Fecha"] = pd.to_datetime(
-    df["Fecha"],
-    errors="coerce",
-)
-
-for columna in [
-    "Suc.",
-    "Lista Utilizada",
-    "Nº Comprobante",
-]:
-    if columna not in df.columns:
-        df[columna] = ""
-
-# Si el histórico viejo no tiene estas columnas,
-# las reconstruimos para mantener compatibilidad.
-if "Resultado Venta-Costo $" not in df.columns:
-    df["Resultado Venta-Costo $"] = (
-        df["Total Venta"] - df["Total Costo"]
-    )
-
-if "Tipo Pago" not in df.columns:
-    forma = (
-        df["Forma Pago"]
-        .fillna("")
-        .astype(str)
-        .str.upper()
-    )
-
-    df["Tipo Pago"] = "OTRO"
-
-    df.loc[
-        forma.str.contains("CONTADO", na=False),
-        "Tipo Pago",
-    ] = "CONTADO"
-
-    df.loc[
-        forma.str.contains(
-            "CUENTA CORRIENTE",
-            na=False,
-        ),
-        "Tipo Pago",
-    ] = "CUENTA CORRIENTE"
+df = enriquecer(historial)
 
 # ============================================================
 # FILTROS
@@ -681,257 +749,109 @@ if "Tipo Pago" not in df.columns:
 
 st.sidebar.header("🔎 Filtros")
 
-fechas_validas = df["Fecha"].dropna()
-
-if fechas_validas.empty:
-
-    st.error(
-        "No hay fechas válidas en el histórico."
-    )
-
-    st.stop()
-
-fecha_min = fechas_validas.min().date()
-fecha_max = fechas_validas.max().date()
+fecha_min = df["Fecha"].min().date()
+fecha_max = df["Fecha"].max().date()
 
 rango_fechas = st.sidebar.date_input(
     "Período",
-    value=(
-        fecha_min,
-        fecha_max,
-    ),
+    value=(fecha_min, fecha_max),
     min_value=fecha_min,
     max_value=fecha_max,
+    format="DD/MM/YYYY",
 )
 
-if (
-    isinstance(rango_fechas, (tuple, list))
-    and len(rango_fechas) == 2
-):
+if isinstance(rango_fechas, (tuple, list)):
+    if len(rango_fechas) == 2:
+        desde, hasta = rango_fechas
+    elif len(rango_fechas) == 1:
+        desde = hasta = rango_fechas[0]
+    else:
+        desde, hasta = fecha_min, fecha_max
+else:
+    desde = hasta = rango_fechas
 
-    fecha_inicio = pd.Timestamp(
-        rango_fechas[0]
+df = df[
+    (df["Fecha"] >= pd.Timestamp(desde))
+    & (df["Fecha"] < pd.Timestamp(hasta) + pd.Timedelta(days=1))
+]
+
+
+def opciones(columna):
+    return sorted(
+        df[columna]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .replace("", pd.NA)
+        .dropna()
+        .unique()
     )
 
-    fecha_fin = (
-        pd.Timestamp(rango_fechas[1])
-        + pd.Timedelta(days=1)
-    )
 
-    df = df[
-        (df["Fecha"] >= fecha_inicio)
-        & (df["Fecha"] < fecha_fin)
-    ]
-
-# Sucursal
-sucursales = sorted(
-    df["Suc."]
-    .fillna("")
-    .astype(str)
-    .str.strip()
-    .replace("", pd.NA)
-    .dropna()
-    .unique()
-)
-
-sucursal = st.sidebar.multiselect(
-    "Sucursal",
-    sucursales,
-)
-
+sucursal = st.sidebar.multiselect("Sucursal", opciones("Suc."))
 if sucursal:
-    df = df[
-        df["Suc."].astype(str).isin(
-            sucursal
-        )
-    ]
+    df = df[df["Suc."].isin(sucursal)]
 
-# Cliente
-clientes = sorted(
-    df["Cliente"]
-    .fillna("")
-    .astype(str)
-    .str.strip()
-    .replace("", pd.NA)
-    .dropna()
-    .unique()
+tipo_operacion = st.sidebar.multiselect(
+    "Tipo de operación",
+    ["Venta", "Devolución / Nota de crédito"],
 )
+if tipo_operacion:
+    df = df[df["Tipo Operacion"].isin(tipo_operacion)]
 
-cliente = st.sidebar.multiselect(
-    "Cliente",
-    clientes,
-)
-
+cliente = st.sidebar.multiselect("Cliente", opciones("Cliente"))
 if cliente:
-    df = df[
-        df["Cliente"].isin(
-            cliente
-        )
-    ]
+    df = df[df["Cliente"].isin(cliente)]
 
-# Tipo de pago
-tipos_pago = sorted(
-    df["Tipo Pago"]
-    .fillna("OTRO")
-    .astype(str)
-    .unique()
-)
-
-tipo_pago = st.sidebar.multiselect(
-    "Tipo de pago",
-    tipos_pago,
-)
-
+tipo_pago = st.sidebar.multiselect("Tipo de pago", opciones("Tipo Pago"))
 if tipo_pago:
-    df = df[
-        df["Tipo Pago"].isin(
-            tipo_pago
-        )
-    ]
+    df = df[df["Tipo Pago"].isin(tipo_pago)]
 
-# Forma exacta
-formas_pago = sorted(
-    df["Forma Pago"]
-    .fillna("")
-    .astype(str)
-    .str.strip()
-    .replace("", pd.NA)
-    .dropna()
-    .unique()
-)
-
-forma_pago = st.sidebar.multiselect(
-    "Forma de pago exacta",
-    formas_pago,
-)
-
+forma_pago = st.sidebar.multiselect("Forma de pago exacta", opciones("Forma Pago"))
 if forma_pago:
-    df = df[
-        df["Forma Pago"].isin(
-            forma_pago
-        )
-    ]
+    df = df[df["Forma Pago"].isin(forma_pago)]
 
-# Lista
-listas = sorted(
-    df["Lista Utilizada"]
-    .fillna("")
-    .astype(str)
-    .str.strip()
-    .replace("", pd.NA)
-    .dropna()
-    .unique()
-)
-
-lista = st.sidebar.multiselect(
-    "Lista utilizada",
-    listas,
-)
-
+lista = st.sidebar.multiselect("Lista utilizada", opciones("Lista Utilizada"))
 if lista:
-    df = df[
-        df["Lista Utilizada"].isin(
-            lista
-        )
-    ]
+    df = df[df["Lista Utilizada"].isin(lista)]
 
-# Artículo
-articulos = sorted(
-    df["Articulo"]
-    .fillna("")
-    .astype(str)
-    .str.strip()
-    .replace("", pd.NA)
-    .dropna()
-    .unique()
-)
-
-articulo = st.sidebar.multiselect(
-    "Artículo",
-    articulos,
-)
-
+articulo = st.sidebar.multiselect("Artículo", opciones("Articulo"))
 if articulo:
-    df = df[
-        df["Articulo"].isin(
-            articulo
-        )
-    ]
-
-# ============================================================
-# SIN RESULTADOS
-# ============================================================
+    df = df[df["Articulo"].isin(articulo)]
 
 if df.empty:
-
-    st.warning(
-        "⚠️ No hay operaciones que coincidan "
-        "con los filtros."
-    )
-
+    st.warning("⚠️ No hay operaciones que coincidan con los filtros.")
     st.stop()
 
 # ============================================================
 # KPIs
 # ============================================================
 
-total_venta = df["Total Venta"].sum()
+ventas_df = df[~df["Es Devolucion"]]
+devol_df = df[df["Es Devolucion"]]
 
-unidades = df["Cantidad"].sum()
+ventas_brutas = ventas_df["Total Venta"].sum()
+devoluciones = devol_df["Total Venta"].sum()  # negativo
+venta_neta = df["Total Venta"].sum()
 
-comprobantes_validos = (
-    df["Nº Comprobante"]
-    .fillna("")
-    .astype(str)
-    .str.strip()
-)
+unidades_netas = df["Cantidad Neta"].sum()
+unidades_vendidas = ventas_df["Cantidad Neta"].sum()
+unidades_devueltas = devol_df["Cantidad Neta"].sum()  # negativo
 
-comprobantes = (
-    comprobantes_validos[
-        comprobantes_validos != ""
-    ].nunique()
-)
+comprobantes_venta = ventas_df.loc[ventas_df["Comprobante"] != "", "Comprobante"].nunique()
+comprobantes_nc = devol_df.loc[devol_df["Comprobante"] != "", "Comprobante"].nunique()
+if comprobantes_venta == 0:
+    comprobantes_venta = len(ventas_df)
 
-if comprobantes == 0:
-    comprobantes = len(df)
+clientes_activos = ventas_df.loc[ventas_df["Cliente"] != "", "Cliente"].nunique()
+articulos_unicos = df.loc[df["Cod"] != "", "Cod"].nunique()
 
-clientes_unicos = (
-    df["Cliente"]
-    .replace("", pd.NA)
-    .dropna()
-    .nunique()
-)
+precio_promedio = ventas_brutas / unidades_vendidas if unidades_vendidas else 0
+ticket_promedio = ventas_brutas / comprobantes_venta if comprobantes_venta else 0
 
-articulos_unicos = (
-    df["Cod"]
-    .replace("", pd.NA)
-    .dropna()
-    .nunique()
-)
-
-cantidad_total = df["Cantidad"].sum()
-
-precio_promedio = (
-    total_venta / cantidad_total
-    if cantidad_total != 0
-    else 0
-)
-
-ticket_promedio = (
-    total_venta / comprobantes
-    if comprobantes != 0
-    else 0
-)
-
-resultado_total = (
-    df["Resultado Venta-Costo $"].sum()
-)
-
-rentabilidad_promedio = (
-    df["Rentabilidad"].mean()
-    if len(df) > 0
-    else 0
-)
+resultado_total = df["Resultado Venta-Costo $"].sum()
+rent_ponderada = rentabilidad_ponderada(df)
+margen_venta = margen_sobre_venta(df)
 
 # ============================================================
 # RESUMEN SUPERIOR
@@ -940,52 +860,22 @@ rentabilidad_promedio = (
 st.subheader("📌 Resumen")
 
 c1, c2, c3, c4 = st.columns(4)
-
-c1.metric(
-    "💰 Facturación",
-    formato_pesos(total_venta),
-)
-
-c2.metric(
-    "📦 Unidades",
-    f"{unidades:,.0f}",
-)
-
-c3.metric(
-    "🧾 Comprobantes",
-    f"{comprobantes:,}",
-)
-
-c4.metric(
-    "👥 Clientes",
-    f"{clientes_unicos:,}",
-)
+c1.metric("💰 Venta neta", formato_pesos(venta_neta))
+c2.metric("🧾 Ventas brutas", formato_pesos(ventas_brutas))
+c3.metric("🔁 Devoluciones / NC", formato_pesos(devoluciones))
+c4.metric("💵 Resultado (venta - costo)", formato_pesos(resultado_total))
 
 c5, c6, c7, c8 = st.columns(4)
-
-c5.metric(
-    "💵 Precio promedio",
-    formato_pesos(precio_promedio),
-)
-
-c6.metric(
-    "🛒 Ticket promedio",
-    formato_pesos(ticket_promedio),
-)
-
-c7.metric(
-    "📈 Rentabilidad % promedio",
-    f"{rentabilidad_promedio:.2f}%",
-)
-
-c8.metric(
-    "💰 Venta - Costo",
-    formato_pesos(resultado_total),
-)
+c5.metric("📦 Unidades netas", formato_entero(unidades_netas))
+c6.metric("🛒 Ticket promedio", formato_pesos(ticket_promedio))
+c7.metric("📈 Rentabilidad s/costo", formato_porcentaje(rent_ponderada))
+c8.metric("👥 Clientes con compras", formato_entero(clientes_activos))
 
 st.caption(
-    "Rentabilidad % = columna original de INFOVENTAS. "
-    "Venta - Costo = diferencia matemática entre ambas columnas."
+    "Venta neta = ventas brutas menos notas de crédito / devoluciones. "
+    "Rentabilidad s/costo = (venta - costo) / costo, ponderada por importes "
+    "(mismo criterio que la columna de INFOVENTAS, pero sin que los renglones "
+    "de notas de crédito en 0 % distorsionen el promedio)."
 )
 
 st.divider()
@@ -1010,490 +900,391 @@ tab_resumen, tab_articulos, tab_clientes, tab_pagos, tab_evolucion, tab_detalle 
 # ============================================================
 
 with tab_resumen:
-
-    st.subheader(
-        "📊 Principales indicadores"
-    )
+    st.subheader("📊 Principales indicadores")
 
     resumen = pd.DataFrame(
         {
             "Indicador": [
-                "Facturación",
-                "Unidades",
-                "Comprobantes",
-                "Clientes",
-                "Artículos",
-                "Precio promedio",
+                "Ventas brutas",
+                "Devoluciones / notas de crédito",
+                "Venta neta",
+                "Unidades vendidas",
+                "Unidades devueltas",
+                "Unidades netas",
+                "Comprobantes de venta",
+                "Notas de crédito",
+                "Clientes con compras",
+                "Artículos distintos",
+                "Precio promedio por unidad",
                 "Ticket promedio",
-                "Rentabilidad % promedio",
-                "Venta - Costo",
+                "Resultado (venta - costo)",
+                "Rentabilidad s/costo",
+                "Margen s/venta",
             ],
             "Valor": [
-                formato_pesos(total_venta),
-                f"{unidades:,.0f}",
-                f"{comprobantes:,}",
-                f"{clientes_unicos:,}",
-                f"{articulos_unicos:,}",
+                formato_pesos(ventas_brutas),
+                formato_pesos(devoluciones),
+                formato_pesos(venta_neta),
+                formato_entero(unidades_vendidas),
+                formato_entero(unidades_devueltas),
+                formato_entero(unidades_netas),
+                formato_entero(comprobantes_venta),
+                formato_entero(comprobantes_nc),
+                formato_entero(clientes_activos),
+                formato_entero(articulos_unicos),
                 formato_pesos(precio_promedio),
                 formato_pesos(ticket_promedio),
-                f"{rentabilidad_promedio:.2f}%",
                 formato_pesos(resultado_total),
+                formato_porcentaje(rent_ponderada),
+                formato_porcentaje(margen_venta),
             ],
         }
     )
 
-    st.dataframe(
-        resumen,
-        use_container_width=True,
-        hide_index=True,
-    )
+    izq, der = st.columns([1, 1])
+
+    with izq:
+        st.dataframe(resumen, use_container_width=True, hide_index=True, height=565)
+
+    with der:
+        fig = go.Figure(
+            go.Waterfall(
+                x=["Ventas brutas", "Devoluciones / NC", "Venta neta"],
+                y=[ventas_brutas, devoluciones, 0],
+                measure=["absolute", "relative", "total"],
+                text=[
+                    formato_pesos(ventas_brutas),
+                    formato_pesos(devoluciones),
+                    formato_pesos(venta_neta),
+                ],
+                textposition="outside",
+                increasing=dict(marker=dict(color=VERDE)),
+                decreasing=dict(marker=dict(color=ROJO)),
+                totals=dict(marker=dict(color=AZUL)),
+                connector=dict(line=dict(color="#94A3B8")),
+                hovertemplate="%{x}<br><b>%{text}</b><extra></extra>",
+            )
+        )
+        fig = _layout_base(fig, "De ventas brutas a venta neta", 565)
+        fig.update_layout(showlegend=False)
+        fig.update_xaxes(fixedrange=True)
+        fig.update_yaxes(
+            fixedrange=True,
+            tickformat=",.0f",
+            showgrid=True,
+            gridcolor="#E2E8F0",
+            range=[0, ventas_brutas * 1.2 if ventas_brutas > 0 else 1],
+        )
+        mostrar_grafico(fig, "grafico_cascada")
 
 # ============================================================
 # ARTÍCULOS
 # ============================================================
 
 with tab_articulos:
-
-    st.subheader(
-        "🔧 Ranking de artículos"
-    )
+    st.subheader("🔧 Ranking de artículos")
 
     ranking_articulos = (
-        df.groupby(
-            ["Cod", "Articulo"],
-            as_index=False,
-            dropna=False,
-        )
-        .agg(
-            Unidades=("Cantidad", "sum"),
-            Facturacion=("Total Venta", "sum"),
-            Resultado=("Resultado Venta-Costo $", "sum"),
-            Rentabilidad_Promedio=("Rentabilidad", "mean"),
-            Operaciones=("Cod", "size"),
-        )
-        .sort_values(
-            "Facturacion",
-            ascending=False,
-        )
+        resumen_por(df, ["Cod", "Articulo"])
+        .sort_values("Venta_Neta", ascending=False)
         .reset_index(drop=True)
     )
+    ranking_articulos.insert(0, "Puesto", range(1, len(ranking_articulos) + 1))
 
-    ranking_articulos.insert(
-        0,
-        "Puesto",
-        range(
-            1,
-            len(ranking_articulos) + 1,
-        ),
+    vista = pd.DataFrame(
+        {
+            "Puesto": ranking_articulos["Puesto"],
+            "Código": ranking_articulos["Cod"],
+            "Artículo": ranking_articulos["Articulo"],
+            "Unidades netas": ranking_articulos["Unidades"].apply(formato_entero),
+            "Venta neta": ranking_articulos["Venta_Neta"].apply(formato_pesos),
+            "Devoluciones": ranking_articulos["Devoluciones"].apply(formato_pesos),
+            "Resultado $": ranking_articulos["Resultado"].apply(formato_pesos),
+            "Rentabilidad": ranking_articulos["Rentabilidad"].apply(formato_porcentaje),
+            "Renglones": ranking_articulos["Renglones"],
+        }
     )
-
-    vista = ranking_articulos.copy()
-
-    vista["Facturación"] = (
-        vista["Facturacion"]
-        .apply(formato_pesos)
-    )
-
-    vista["Resultado $"] = (
-        vista["Resultado"]
-        .apply(formato_pesos)
-    )
-
-    vista["Rentabilidad %"] = (
-        vista["Rentabilidad_Promedio"]
-        .apply(
-            lambda x: f"{x:.2f}%"
-        )
-    )
-
-    vista = vista[
-        [
-            "Puesto",
-            "Cod",
-            "Articulo",
-            "Unidades",
-            "Facturación",
-            "Resultado $",
-            "Rentabilidad %",
-            "Operaciones",
-        ]
-    ]
 
     st.dataframe(
-        vista.head(50),
+        vista.head(100),
         use_container_width=True,
         hide_index=True,
+        column_config={
+            "Artículo": st.column_config.TextColumn("Artículo", width="large"),
+        },
     )
 
-    st.subheader(
-        "📊 Artículos con mayor facturación"
-    )
-
-    grafico = (
-        ranking_articulos
-        .sort_values(
-            "Facturacion",
-            ascending=False,
+    top_venta = ranking_articulos[ranking_articulos["Venta_Neta"] > 0].head(15)
+    if not top_venta.empty:
+        fig = grafico_barras_horizontal(
+            [etiqueta_articulo(c, a) for c, a in zip(top_venta["Cod"], top_venta["Articulo"])],
+            top_venta["Venta_Neta"],
+            "Artículos con mayor venta neta",
+            formato_pesos,
+            color=AZUL,
+            alto_por_barra=66,
         )
+        mostrar_grafico(fig, "grafico_articulos_venta")
+
+    top_unidades = (
+        ranking_articulos[ranking_articulos["Unidades"] > 0]
+        .sort_values("Unidades", ascending=False)
         .head(15)
-        .copy()
     )
-
-    grafico["Artículo"] = (
-        grafico["Cod"]
-        + " - "
-        + grafico["Articulo"]
-    )
-
-    st.bar_chart(
-        grafico.set_index(
-            "Artículo"
-        )["Facturacion"]
-    )
-
-    st.subheader(
-        "📦 Artículos por cantidad"
-    )
-
-    grafico_cantidad = (
-        ranking_articulos
-        .sort_values(
-            "Unidades",
-            ascending=False,
+    if not top_unidades.empty:
+        fig = grafico_barras_horizontal(
+            [etiqueta_articulo(c, a) for c, a in zip(top_unidades["Cod"], top_unidades["Articulo"])],
+            top_unidades["Unidades"],
+            "Artículos más vendidos (unidades netas)",
+            formato_entero,
+            color=VERDE,
+            alto_por_barra=66,
         )
-        .head(15)
-        .copy()
-    )
-
-    grafico_cantidad["Artículo"] = (
-        grafico_cantidad["Cod"]
-        + " - "
-        + grafico_cantidad["Articulo"]
-    )
-
-    st.bar_chart(
-        grafico_cantidad.set_index(
-            "Artículo"
-        )["Unidades"]
-    )
+        mostrar_grafico(fig, "grafico_articulos_unidades")
 
 # ============================================================
 # CLIENTES
 # ============================================================
 
 with tab_clientes:
-
-    st.subheader(
-        "👥 Ranking de compradores"
-    )
+    st.subheader("👥 Ranking de compradores")
 
     ranking_clientes = (
-        df.groupby(
-            "Cliente",
-            as_index=False,
-            dropna=False,
-        )
-        .agg(
-            Facturacion=("Total Venta", "sum"),
-            Unidades=("Cantidad", "sum"),
-            Resultado=("Resultado Venta-Costo $", "sum"),
-            Rentabilidad_Promedio=("Rentabilidad", "mean"),
-            Operaciones=("Cliente", "size"),
-        )
-        .sort_values(
-            "Facturacion",
-            ascending=False,
-        )
+        resumen_por(df, ["Cliente"])
+        .sort_values("Venta_Neta", ascending=False)
         .reset_index(drop=True)
     )
+    ranking_clientes.insert(0, "Puesto", range(1, len(ranking_clientes) + 1))
 
-    ranking_clientes.insert(
-        0,
-        "Puesto",
-        range(
-            1,
-            len(ranking_clientes) + 1,
-        ),
+    def estado_cliente(fila):
+        if fila["Devoluciones"] < 0 and fila["Venta_Neta"] <= 0:
+            return "Saldo cancelado por NC / devoluciones"
+        if fila["Devoluciones"] < 0:
+            return "Con devoluciones"
+        return "Normal"
+
+    ranking_clientes["Estado"] = ranking_clientes.apply(estado_cliente, axis=1)
+
+    vista = pd.DataFrame(
+        {
+            "Puesto": ranking_clientes["Puesto"],
+            "Cliente": ranking_clientes["Cliente"],
+            "Ventas brutas": ranking_clientes["Ventas_Brutas"].apply(formato_pesos),
+            "Devoluciones": ranking_clientes["Devoluciones"].apply(formato_pesos),
+            "Venta neta": ranking_clientes["Venta_Neta"].apply(formato_pesos),
+            "Unidades netas": ranking_clientes["Unidades"].apply(formato_entero),
+            "Resultado $": ranking_clientes["Resultado"].apply(formato_pesos),
+            "Rentabilidad": ranking_clientes["Rentabilidad"].apply(formato_porcentaje),
+            "Estado": ranking_clientes["Estado"],
+        }
     )
 
-    vista = ranking_clientes.copy()
+    st.dataframe(vista.head(100), use_container_width=True, hide_index=True)
 
-    vista["Facturación"] = (
-        vista["Facturacion"]
-        .apply(formato_pesos)
-    )
-
-    vista["Resultado $"] = (
-        vista["Resultado"]
-        .apply(formato_pesos)
-    )
-
-    vista["Rentabilidad %"] = (
-        vista["Rentabilidad_Promedio"]
-        .apply(
-            lambda x: f"{x:.2f}%"
+    top_clientes = ranking_clientes[ranking_clientes["Venta_Neta"] > 0].head(15)
+    if not top_clientes.empty:
+        fig = grafico_barras_horizontal(
+            [etiqueta_texto(c) for c in top_clientes["Cliente"]],
+            top_clientes["Venta_Neta"],
+            "Compradores con mayor venta neta",
+            formato_pesos,
+            color=AZUL,
         )
-    )
+        mostrar_grafico(fig, "grafico_clientes")
 
-    vista = vista[
-        [
-            "Puesto",
-            "Cliente",
-            "Facturación",
-            "Unidades",
-            "Resultado $",
-            "Rentabilidad %",
-            "Operaciones",
-        ]
-    ]
-
-    # IMPORTANTE:
-    # hide_index=True elimina el número automático
-    # que aparecía a la izquierda de la tabla.
-    st.dataframe(
-        vista.head(50),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    st.subheader(
-        "📊 Compradores con mayor facturación"
-    )
-
-    grafico = (
-        ranking_clientes
-        .head(15)
-        .copy()
-    )
-
-    st.bar_chart(
-        grafico.set_index(
-            "Cliente"
-        )["Facturacion"]
-    )
+    anulados = ranking_clientes[ranking_clientes["Estado"] != "Normal"]
+    if not anulados.empty:
+        st.caption(
+            "Los clientes con venta neta en cero o negativa (por notas de crédito "
+            "o saldos cancelados) no entran en el gráfico, pero sí figuran en la "
+            "tabla con su estado."
+        )
 
 # ============================================================
 # PAGOS
 # ============================================================
 
 with tab_pagos:
-
-    st.subheader(
-        "💳 Contado vs cuenta corriente"
-    )
+    st.subheader("💳 Contado vs cuenta corriente")
 
     ranking_tipo_pago = (
-        df.groupby(
-            "Tipo Pago",
-            as_index=False,
-        )
-        .agg(
-            Facturacion=("Total Venta", "sum"),
-            Unidades=("Cantidad", "sum"),
-            Operaciones=("Tipo Pago", "size"),
-        )
-        .sort_values(
-            "Facturacion",
-            ascending=False,
-        )
+        resumen_por(df, ["Tipo Pago"])
+        .sort_values("Venta_Neta", ascending=False)
         .reset_index(drop=True)
     )
 
-    ranking_tipo_pago.insert(
-        0,
-        "Puesto",
-        range(
-            1,
-            len(ranking_tipo_pago) + 1,
-        ),
+    vista = pd.DataFrame(
+        {
+            "Tipo de pago": ranking_tipo_pago["Tipo Pago"],
+            "Venta neta": ranking_tipo_pago["Venta_Neta"].apply(formato_pesos),
+            "Devoluciones": ranking_tipo_pago["Devoluciones"].apply(formato_pesos),
+            "Unidades netas": ranking_tipo_pago["Unidades"].apply(formato_entero),
+            "Renglones": ranking_tipo_pago["Renglones"],
+        }
     )
+    st.dataframe(vista, use_container_width=True, hide_index=True)
 
-    vista = ranking_tipo_pago.copy()
+    col_a, col_b = st.columns(2)
 
-    vista["Facturación"] = (
-        vista["Facturacion"]
-        .apply(formato_pesos)
-    )
+    positivos = ranking_tipo_pago[ranking_tipo_pago["Venta_Neta"] > 0]
 
-    st.dataframe(
-        vista[
-            [
-                "Puesto",
-                "Tipo Pago",
-                "Facturación",
-                "Unidades",
-                "Operaciones",
-            ]
-        ],
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    st.subheader(
-        "📊 Facturación por tipo de pago"
-    )
-
-    st.bar_chart(
-        ranking_tipo_pago.set_index(
-            "Tipo Pago"
-        )["Facturacion"]
-    )
-
-    st.subheader(
-        "🥧 Distribución de facturación"
-    )
-
-    try:
-        import plotly.express as px
-
-        pie = ranking_tipo_pago[
-            ranking_tipo_pago["Facturacion"] != 0
-        ].copy()
-
-        if not pie.empty:
-
-            fig = px.pie(
-                pie,
-                names="Tipo Pago",
-                values="Facturacion",
-                hole=0.35,
+    with col_a:
+        if not positivos.empty:
+            fig = grafico_dona(
+                positivos["Tipo Pago"],
+                positivos["Venta_Neta"],
+                "Distribución de la venta neta",
             )
-
-            fig.update_layout(
-                margin=dict(
-                    l=10,
-                    r=10,
-                    t=30,
-                    b=10,
-                ),
-            )
-
-            st.plotly_chart(
-                fig,
-                use_container_width=True,
-            )
-
+            mostrar_grafico(fig, "grafico_dona_pago")
         else:
+            st.info("No hay venta neta positiva para mostrar.")
 
-            st.info(
-                "No hay facturación distinta de cero "
-                "para mostrar."
-            )
-
-    except ImportError:
-
-        st.warning(
-            "Falta Plotly. Verificá requirements.txt."
+    with col_b:
+        fig = grafico_barras_horizontal(
+            list(ranking_tipo_pago["Tipo Pago"]),
+            ranking_tipo_pago["Venta_Neta"],
+            "Venta neta por tipo de pago",
+            formato_pesos,
+            color=AZUL,
+            alto_por_barra=90,
         )
+        fig.update_layout(height=400)
+        mostrar_grafico(fig, "grafico_barras_pago")
 
-    st.subheader(
-        "💳 Formas de pago exactas"
-    )
+    st.subheader("💳 Formas de pago exactas")
 
-    ranking_forma_pago = (
-        df.groupby(
-            "Forma Pago",
-            as_index=False,
-        )
-        .agg(
-            Facturacion=("Total Venta", "sum"),
-            Unidades=("Cantidad", "sum"),
-        )
-        .sort_values(
-            "Facturacion",
-            ascending=False,
-        )
+    ranking_forma = (
+        resumen_por(df, ["Forma Pago"])
+        .sort_values("Venta_Neta", ascending=False)
         .reset_index(drop=True)
     )
 
-    ranking_forma_pago["Facturación"] = (
-        ranking_forma_pago["Facturacion"]
-        .apply(formato_pesos)
-    )
-
     st.dataframe(
-        ranking_forma_pago[
-            [
-                "Forma Pago",
-                "Facturación",
-                "Unidades",
-            ]
-        ],
+        pd.DataFrame(
+            {
+                "Forma de pago": ranking_forma["Forma Pago"],
+                "Venta neta": ranking_forma["Venta_Neta"].apply(formato_pesos),
+                "Unidades netas": ranking_forma["Unidades"].apply(formato_entero),
+            }
+        ),
         use_container_width=True,
         hide_index=True,
     )
+
+    positivas = ranking_forma[ranking_forma["Venta_Neta"] > 0]
+    if not positivas.empty:
+        fig = grafico_barras_horizontal(
+            [etiqueta_texto(f) for f in positivas["Forma Pago"]],
+            positivas["Venta_Neta"],
+            "Venta neta por forma de pago",
+            formato_pesos,
+            color=VERDE,
+            alto_por_barra=70,
+        )
+        mostrar_grafico(fig, "grafico_forma_pago")
 
 # ============================================================
 # EVOLUCIÓN
 # ============================================================
 
 with tab_evolucion:
-
-    st.subheader(
-        "📅 Evolución diaria"
-    )
+    st.subheader("📅 Evolución diaria")
 
     ventas_dia = (
-        df.assign(
-            DiaFecha=df["Fecha"].dt.date
+        resumen_por(df, ["Dia"]).sort_values("Dia").reset_index(drop=True)
+    )
+
+    if len(ventas_dia) == 1:
+        st.info(
+            "Hay un solo día en el período seleccionado. "
+            "Cargá más días para ver la evolución."
         )
-        .groupby(
-            "DiaFecha",
-            as_index=False,
+
+    x_fechas = ventas_dia["Dia"]
+
+    fig = go.Figure(
+        go.Scatter(
+            x=x_fechas,
+            y=ventas_dia["Venta_Neta"],
+            mode="lines+markers",
+            line=dict(color=AZUL, width=3),
+            marker=dict(size=9, color=AZUL, line=dict(color="white", width=2)),
+            fill="tozeroy",
+            fillcolor="rgba(37, 99, 235, 0.10)",
+            customdata=[formato_pesos(v) for v in ventas_dia["Venta_Neta"]],
+            hovertemplate="%{x|%d/%m/%Y}<br><b>%{customdata}</b><extra></extra>",
         )
-        .agg(
-            Facturacion=("Total Venta", "sum"),
-            Unidades=("Cantidad", "sum"),
-            Resultado=("Resultado Venta-Costo $", "sum"),
+    )
+    fig = _layout_base(fig, "Venta neta por día", 420)
+    fig.update_layout(showlegend=False)
+    fig.update_xaxes(
+        tickformat="%d/%m/%Y",
+        type="date",
+        fixedrange=True,
+        showgrid=False,
+    )
+    fig.update_yaxes(
+        tickformat=",.0f",
+        fixedrange=True,
+        showgrid=True,
+        gridcolor="#E2E8F0",
+        rangemode="tozero",
+    )
+    mostrar_grafico(fig, "grafico_evolucion_venta")
+
+    fig = go.Figure(
+        go.Bar(
+            x=x_fechas,
+            y=ventas_dia["Unidades"],
+            marker=dict(color=VERDE),
+            customdata=[formato_entero(v) for v in ventas_dia["Unidades"]],
+            hovertemplate="%{x|%d/%m/%Y}<br><b>%{customdata} unidades</b><extra></extra>",
         )
-        .sort_values(
-            "DiaFecha"
+    )
+    fig = _layout_base(fig, "Unidades netas por día", 380)
+    fig.update_layout(showlegend=False, bargap=0.4)
+    fig.update_xaxes(tickformat="%d/%m/%Y", type="date", fixedrange=True)
+    fig.update_yaxes(
+        tickformat=",.0f", fixedrange=True, showgrid=True, gridcolor="#E2E8F0"
+    )
+    mostrar_grafico(fig, "grafico_evolucion_unidades")
+
+    por_pago = (
+        resumen_por(df, ["Dia", "Tipo Pago"]).sort_values(["Dia", "Tipo Pago"])
+    )
+    fig = go.Figure()
+    for i, tipo in enumerate(sorted(por_pago["Tipo Pago"].unique())):
+        sub = por_pago[por_pago["Tipo Pago"] == tipo]
+        fig.add_trace(
+            go.Bar(
+                x=sub["Dia"],
+                y=sub["Venta_Neta"],
+                name=tipo,
+                marker=dict(color=PALETA[i % len(PALETA)]),
+                customdata=[formato_pesos(v) for v in sub["Venta_Neta"]],
+                hovertemplate="%{x|%d/%m/%Y}<br>" + tipo + ": <b>%{customdata}</b><extra></extra>",
+            )
         )
+    fig = _layout_base(fig, "Venta neta por día según tipo de pago", 420)
+    fig.update_layout(barmode="stack", bargap=0.4)
+    fig.update_xaxes(tickformat="%d/%m/%Y", type="date", fixedrange=True)
+    fig.update_yaxes(
+        tickformat=",.0f", fixedrange=True, showgrid=True, gridcolor="#E2E8F0"
     )
+    mostrar_grafico(fig, "grafico_evolucion_pago")
 
-    st.line_chart(
-        ventas_dia.set_index(
-            "DiaFecha"
-        )[
-            ["Facturacion"]
-        ]
-    )
-
-    st.subheader(
-        "📦 Unidades por día"
-    )
-
-    st.line_chart(
-        ventas_dia.set_index(
-            "DiaFecha"
-        )[
-            ["Unidades"]
-        ]
-    )
-
-    vista = ventas_dia.copy()
-
-    vista["Facturación"] = (
-        vista["Facturacion"]
-        .apply(formato_pesos)
-    )
-
-    vista["Resultado $"] = (
-        vista["Resultado"]
-        .apply(formato_pesos)
-    )
-
+    tabla_dia = ventas_dia.sort_values("Dia", ascending=False)
     st.dataframe(
-        vista[
-            [
-                "DiaFecha",
-                "Facturación",
-                "Unidades",
-                "Resultado $",
-            ]
-        ].sort_values(
-            "DiaFecha",
-            ascending=False,
+        pd.DataFrame(
+            {
+                "Fecha": tabla_dia["Dia"].dt.strftime("%d/%m/%Y"),
+                "Día": tabla_dia["Dia"].dt.dayofweek.map(DIAS_SEMANA),
+                "Ventas brutas": tabla_dia["Ventas_Brutas"].apply(formato_pesos),
+                "Devoluciones": tabla_dia["Devoluciones"].apply(formato_pesos),
+                "Venta neta": tabla_dia["Venta_Neta"].apply(formato_pesos),
+                "Unidades netas": tabla_dia["Unidades"].apply(formato_entero),
+                "Resultado $": tabla_dia["Resultado"].apply(formato_pesos),
+            }
         ),
         use_container_width=True,
         hide_index=True,
@@ -1504,93 +1295,59 @@ with tab_evolucion:
 # ============================================================
 
 with tab_detalle:
+    st.subheader("📋 Detalle de operaciones")
 
-    st.subheader(
-        "📋 Detalle de operaciones"
+    detalle = df.sort_values(["Fecha", "Comprobante"], ascending=[False, False]).reset_index(drop=True)
+
+    tabla = pd.DataFrame(
+        {
+            "Nº": range(1, len(detalle) + 1),
+            "Fecha": formato_fecha(detalle["Fecha"]),
+            "Comprobante": detalle["Comprobante"],
+            "Tipo": detalle["Tipo Operacion"],
+            "Código": detalle["Cod"],
+            "Artículo": detalle["Articulo"],
+            "Cantidad": detalle["Cantidad Neta"].apply(formato_entero),
+            "Cliente": detalle["Cliente"],
+            "Precio unitario": detalle["Precio Unitario"].apply(formato_pesos),
+            "Total venta": detalle["Total Venta"].apply(formato_pesos),
+            "Forma de pago": detalle["Forma Pago"],
+            "Tipo de pago": detalle["Tipo Pago"],
+            "Rentabilidad": detalle["Rentabilidad Real"].apply(formato_porcentaje),
+            "Resultado $": detalle["Resultado Venta-Costo $"].apply(formato_pesos),
+        }
     )
-
-    columnas_mostrar = [
-        "Fecha",
-        "Cod",
-        "Articulo",
-        "Cantidad",
-        "Cliente",
-        "Precio Unitario",
-        "Total Venta",
-        "Forma Pago",
-        "Tipo Pago",
-        "Rentabilidad",
-        "Resultado Venta-Costo $",
-    ]
-
-    columnas_mostrar = [
-        c
-        for c in columnas_mostrar
-        if c in df.columns
-    ]
-
-    detalle = (
-        df[columnas_mostrar]
-        .sort_values(
-            "Fecha",
-            ascending=False,
-        )
-        .reset_index(drop=True)
-    )
-
-    detalle.insert(
-        0,
-        "Nº",
-        range(
-            1,
-            len(detalle) + 1,
-        ),
-    )
-
-    detalle["Fecha"] = (
-        detalle["Fecha"]
-        .dt.strftime("%d/%m/%Y")
-    )
-
-    for columna in [
-        "Precio Unitario",
-        "Total Venta",
-        "Resultado Venta-Costo $",
-    ]:
-
-        if columna in detalle.columns:
-            detalle[columna] = (
-                detalle[columna]
-                .apply(formato_pesos)
-            )
-
-    if "Rentabilidad" in detalle.columns:
-
-        detalle["Rentabilidad"] = (
-            detalle["Rentabilidad"]
-            .apply(
-                lambda x: f"{x:.2f}%"
-            )
-        )
 
     st.dataframe(
-        detalle,
+        tabla,
         use_container_width=True,
         hide_index=True,
+        column_config={
+            "Artículo": st.column_config.TextColumn("Artículo", width="large"),
+        },
     )
 
-    # Descargar sin columnas internas.
-    csv = (
-        df.drop(
-            columns=[
-                "_FilaArchivo",
-                "_FirmaFila",
-            ],
-            errors="ignore",
-        )
-        .to_csv(index=False)
-        .encode("utf-8-sig")
+    # Descarga lista para abrir en Excel argentino (separador ; y coma decimal)
+    export = pd.DataFrame(
+        {
+            "Fecha": formato_fecha(detalle["Fecha"]),
+            "Comprobante": detalle["Comprobante"],
+            "Tipo": detalle["Tipo Operacion"],
+            "Código": detalle["Cod"],
+            "Artículo": detalle["Articulo"],
+            "Cantidad": detalle["Cantidad Neta"],
+            "Cliente": detalle["Cliente"],
+            "Precio unitario": detalle["Precio Unitario"],
+            "Total costo": detalle["Total Costo"],
+            "Total venta": detalle["Total Venta"],
+            "Forma de pago": detalle["Forma Pago"],
+            "Tipo de pago": detalle["Tipo Pago"],
+            "Rentabilidad %": detalle["Rentabilidad Real"].round(2),
+            "Resultado $": detalle["Resultado Venta-Costo $"],
+        }
     )
+
+    csv = export.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
 
     st.download_button(
         "📥 Descargar datos filtrados",
