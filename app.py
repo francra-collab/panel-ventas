@@ -3,7 +3,7 @@ import pandas as pd
 import requests
 import io
 import base64
-from datetime import datetime
+import hashlib
 
 # ============================================================
 # CONFIGURACIÓN
@@ -12,22 +12,47 @@ from datetime import datetime
 st.set_page_config(
     page_title="Panel de Ventas",
     page_icon="📊",
-    layout="wide"
+    layout="wide",
 )
 
 HISTORIAL_PATH = "data/historial.csv"
+
+COLUMNAS_REQUERIDAS = [
+    "Fecha",
+    "Cod",
+    "Articulo",
+    "Cantidad",
+    "Cliente",
+    "Precio Costo",
+    "Total Costo",
+    "Rentabilidad",
+    "Precio Vent.",
+    "Total Venta",
+    "Forma Pago",
+]
+
+COLUMNAS_NUMERICAS = [
+    "Cantidad",
+    "Precio Costo",
+    "Total Costo",
+    "Rentabilidad",
+    "Precio Vent.",
+    "Total Venta",
+]
+
+COLUMNAS_TEXTO = [
+    "Cod",
+    "Articulo",
+    "Cliente",
+    "Forma Pago",
+]
 
 # ============================================================
 # FUNCIONES GENERALES
 # ============================================================
 
 def numero(valor):
-    """
-    Convierte números argentinos:
-    12.345,67
-    12345,67
-    12345.67
-    """
+    """Convierte números argentinos y números normales a float."""
     if pd.isna(valor):
         return 0.0
 
@@ -36,143 +61,111 @@ def numero(valor):
     if texto == "":
         return 0.0
 
+    texto = texto.replace("$", "").replace(" ", "")
+
     try:
-        # Si tiene punto y coma, asumimos formato argentino
         if "." in texto and "," in texto:
             texto = texto.replace(".", "").replace(",", ".")
         elif "," in texto:
             texto = texto.replace(",", ".")
-
         return float(texto)
-
-    except Exception:
+    except (ValueError, TypeError):
         return 0.0
 
 
+def limpiar_columnas(df):
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.dropna(axis=1, how="all")
+    return df
+
+
 def leer_infoventas(archivo):
-    """
-    Intenta leer:
-    - XLSX
-    - XLS
-    - TXT/CSV/tabulado
-    """
-
+    """Intenta leer XLSX/XLS y, si no funciona, TXT/CSV."""
     contenido = archivo.getvalue()
+    nombre = str(getattr(archivo, "name", "")).lower()
 
-    # Primero intentamos Excel
+    if nombre.endswith((".xlsx", ".xls", ".xlsm")):
+        for kwargs in (
+            {"engine": "openpyxl"},
+            {"engine": "xlrd"},
+        ):
+            try:
+                df = pd.read_excel(io.BytesIO(contenido), **kwargs)
+                df = limpiar_columnas(df)
+                if len(df.columns) > 3:
+                    return df
+            except Exception:
+                pass
+
     try:
         df = pd.read_excel(io.BytesIO(contenido))
+        df = limpiar_columnas(df)
         if len(df.columns) > 3:
             return df
     except Exception:
         pass
 
-    # Si no es Excel, intentamos texto tabulado
-    for encoding in ["cp1252", "latin1", "utf-8"]:
+    for encoding in ("cp1252", "latin1", "utf-8-sig", "utf-8"):
         try:
             df = pd.read_csv(
                 io.BytesIO(contenido),
                 sep="\t",
-                encoding=encoding
+                encoding=encoding,
             )
-
+            df = limpiar_columnas(df)
             if len(df.columns) > 3:
                 return df
         except Exception:
             pass
 
-    # Último intento: CSV normal
-    for encoding in ["cp1252", "latin1", "utf-8"]:
+    for encoding in ("cp1252", "latin1", "utf-8-sig", "utf-8"):
         try:
             df = pd.read_csv(
                 io.BytesIO(contenido),
-                encoding=encoding
+                encoding=encoding,
             )
-
+            df = limpiar_columnas(df)
             if len(df.columns) > 3:
                 return df
         except Exception:
             pass
 
     raise ValueError(
-        "No pude reconocer el formato del archivo INFOVENTAS."
+        "No pude reconocer el archivo. "
+        "Probá con el Excel original de INFOVENTAS (.xls o .xlsx)."
     )
 
 
 def preparar_datos(df):
-
-    # Limpiar nombres de columnas
-    df.columns = [
-        str(c).strip()
-        for c in df.columns
-    ]
-
-    # Eliminar columnas completamente vacías
-    df = df.dropna(axis=1, how="all")
-
-    columnas_necesarias = [
-        "Fecha",
-        "Cod",
-        "Articulo",
-        "Cantidad",
-        "Cliente",
-        "Precio Costo",
-        "Total Costo",
-        "Rentabilidad",
-        "Precio Vent.",
-        "Total Venta",
-        "Forma Pago"
-    ]
+    df = limpiar_columnas(df)
 
     faltantes = [
-        c for c in columnas_necesarias
+        c for c in COLUMNAS_REQUERIDAS
         if c not in df.columns
     ]
 
     if faltantes:
         raise ValueError(
-            "Faltan estas columnas en el INFOVENTAS: "
+            "Faltan columnas obligatorias: "
             + ", ".join(faltantes)
         )
-
-    # --------------------------------------------------------
-    # Fechas
-    # --------------------------------------------------------
 
     df["Fecha"] = pd.to_datetime(
         df["Fecha"],
         dayfirst=True,
-        errors="coerce"
+        errors="coerce",
     )
 
-    # --------------------------------------------------------
-    # Números
-    # --------------------------------------------------------
+    if df["Fecha"].isna().sum() == len(df):
+        raise ValueError(
+            "No pude reconocer ninguna fecha de la columna 'Fecha'."
+        )
 
-    columnas_numericas = [
-        "Cantidad",
-        "Precio Costo",
-        "Total Costo",
-        "Rentabilidad",
-        "Precio Vent.",
-        "Total Venta"
-    ]
-
-    for columna in columnas_numericas:
+    for columna in COLUMNAS_NUMERICAS:
         df[columna] = df[columna].apply(numero)
 
-    # --------------------------------------------------------
-    # Texto
-    # --------------------------------------------------------
-
-    columnas_texto = [
-        "Cod",
-        "Articulo",
-        "Cliente",
-        "Forma Pago"
-    ]
-
-    for columna in columnas_texto:
+    for columna in COLUMNAS_TEXTO:
         df[columna] = (
             df[columna]
             .fillna("")
@@ -180,38 +173,88 @@ def preparar_datos(df):
             .str.strip()
         )
 
-    # --------------------------------------------------------
+    for columna in [
+        "TC",
+        "Suc.",
+        "Nº Comprobante",
+        "Lista Utilizada",
+        "Porcentaje Comisión",
+        "Monto Comisión",
+    ]:
+        if columna not in df.columns:
+            df[columna] = ""
+
     # Precio real por unidad
-    # --------------------------------------------------------
-
     df["Precio Unitario"] = 0.0
-
-    mask = df["Cantidad"] != 0
-
-    df.loc[mask, "Precio Unitario"] = (
-        df.loc[mask, "Total Venta"]
-        / df.loc[mask, "Cantidad"]
+    mascara = df["Cantidad"] != 0
+    df.loc[mascara, "Precio Unitario"] = (
+        df.loc[mascara, "Total Venta"]
+        / df.loc[mascara, "Cantidad"]
     )
 
-    # --------------------------------------------------------
-    # Rentabilidad en pesos
-    # --------------------------------------------------------
-
-    df["Rentabilidad $"] = (
-        df["Total Venta"]
-        - df["Total Costo"]
+    # Este cálculo es independiente de la columna
+    # Rentabilidad (%) que ya viene en INFOVENTAS.
+    df["Resultado Venta-Costo $"] = (
+        df["Total Venta"] - df["Total Costo"]
     )
 
-    # --------------------------------------------------------
-    # Día
-    # --------------------------------------------------------
+    # Agrupación solicitada: contado / cuenta corriente / otro
+    forma = df["Forma Pago"].str.upper()
+
+    df["Tipo Pago"] = "OTRO"
+
+    df.loc[
+        forma.str.contains("CONTADO", na=False),
+        "Tipo Pago"
+    ] = "CONTADO"
+
+    df.loc[
+        forma.str.contains("CUENTA CORRIENTE", na=False),
+        "Tipo Pago"
+    ] = "CUENTA CORRIENTE"
 
     df["Dia"] = df["Fecha"].dt.date.astype(str)
 
-    # --------------------------------------------------------
-    # Identificador de operación
-    # --------------------------------------------------------
+    # Número de fila original para distinguir dos renglones iguales.
+    df["_FilaArchivo"] = range(1, len(df) + 1)
 
+    # Firma de fila para evitar volver a cargar exactamente
+    # el mismo renglón del mismo archivo.
+    columnas_firma = [
+        "Fecha",
+        "Cod",
+        "Articulo",
+        "Cantidad",
+        "Cliente",
+        "Total Venta",
+        "Total Costo",
+        "Nº Comprobante",
+        "_FilaArchivo",
+    ]
+
+    def firma_fila(fila):
+        partes = []
+
+        for columna in columnas_firma:
+            valor = fila.get(columna, "")
+
+            if isinstance(valor, pd.Timestamp):
+                valor = valor.isoformat()
+
+            partes.append(str(valor))
+
+        texto = "|".join(partes)
+
+        return hashlib.sha256(
+            texto.encode("utf-8")
+        ).hexdigest()
+
+    df["_FirmaFila"] = df.apply(
+        firma_fila,
+        axis=1,
+    )
+
+    # ID compatible con el histórico anterior.
     df["ID Operacion"] = (
         df["Fecha"].astype(str)
         + "|"
@@ -232,26 +275,33 @@ def preparar_datos(df):
 # ============================================================
 
 def github_configurado():
-
-    return (
-        "GITHUB_TOKEN" in st.secrets
-        and "GITHUB_REPO" in st.secrets
-        and "GITHUB_USER" in st.secrets
-    )
+    try:
+        return all(
+            clave in st.secrets
+            and str(st.secrets[clave]).strip() != ""
+            for clave in (
+                "GITHUB_TOKEN",
+                "GITHUB_REPO",
+                "GITHUB_USER",
+            )
+        )
+    except Exception:
+        return False
 
 
 def github_headers():
-
     return {
-        "Authorization": f"Bearer {st.secrets['GITHUB_TOKEN']}",
-        "Accept": "application/vnd.github+json"
+        "Authorization": (
+            f"Bearer {st.secrets['GITHUB_TOKEN']}"
+        ),
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
     }
 
 
 def github_url():
-
     return (
-        f"https://api.github.com/repos/"
+        "https://api.github.com/repos/"
         f"{st.secrets['GITHUB_USER']}/"
         f"{st.secrets['GITHUB_REPO']}/contents/"
         f"{HISTORIAL_PATH}"
@@ -259,16 +309,14 @@ def github_url():
 
 
 def cargar_historial():
-
     if not github_configurado():
         return pd.DataFrame()
 
     try:
-
         respuesta = requests.get(
             github_url(),
             headers=github_headers(),
-            timeout=20
+            timeout=20,
         )
 
         if respuesta.status_code == 404:
@@ -276,45 +324,53 @@ def cargar_historial():
 
         respuesta.raise_for_status()
 
-        contenido = respuesta.json()["content"]
+        datos = respuesta.json()
 
-        datos = base64.b64decode(contenido)
+        if "content" not in datos:
+            return pd.DataFrame()
+
+        contenido = base64.b64decode(
+            datos["content"]
+        )
 
         df = pd.read_csv(
-            io.BytesIO(datos)
+            io.BytesIO(contenido)
         )
 
         if "Fecha" in df.columns:
             df["Fecha"] = pd.to_datetime(
                 df["Fecha"],
-                errors="coerce"
+                errors="coerce",
             )
 
         return df
 
     except Exception as e:
-
-        st.warning(
-            f"No se pudo cargar el historial: {e}"
+        st.error(
+            "No se pudo leer el historial de GitHub. "
+            f"Detalle: {e}"
         )
-
         return pd.DataFrame()
 
 
 def guardar_historial(df):
-
     if not github_configurado():
-
         st.error(
-            "Todavía no está configurado GitHub para guardar "
-            "el historial."
+            "GitHub no está configurado en los Secrets de Streamlit."
         )
-
         return False
 
     try:
+        df_guardar = df.copy()
 
-        contenido_csv = df.to_csv(
+        if "Fecha" in df_guardar.columns:
+            df_guardar = df_guardar.sort_values(
+                "Fecha",
+                ascending=True,
+                na_position="last",
+            )
+
+        contenido_csv = df_guardar.to_csv(
             index=False
         ).encode("utf-8")
 
@@ -322,22 +378,23 @@ def guardar_historial(df):
             contenido_csv
         ).decode("utf-8")
 
-        # Buscar archivo existente
         respuesta = requests.get(
             github_url(),
             headers=github_headers(),
-            timeout=20
+            timeout=20,
         )
 
         sha = None
 
         if respuesta.status_code == 200:
-            sha = respuesta.json()["sha"]
+            sha = respuesta.json().get("sha")
+        elif respuesta.status_code != 404:
+            respuesta.raise_for_status()
 
         datos = {
             "message": "Actualizar historial de ventas",
             "content": contenido_base64,
-            "branch": "main"
+            "branch": "main",
         }
 
         if sha:
@@ -347,7 +404,7 @@ def guardar_historial(df):
             github_url(),
             headers=github_headers(),
             json=datos,
-            timeout=30
+            timeout=60,
         )
 
         respuesta.raise_for_status()
@@ -355,12 +412,22 @@ def guardar_historial(df):
         return True
 
     except Exception as e:
-
         st.error(
-            f"No se pudo guardar el historial: {e}"
+            "No se pudo guardar el historial en GitHub. "
+            f"Detalle: {e}"
         )
-
         return False
+
+
+# ============================================================
+# PRESENTACIÓN
+# ============================================================
+
+def formato_pesos(valor):
+    try:
+        return f"$ {float(valor):,.2f}"
+    except Exception:
+        return "$ 0.00"
 
 
 # ============================================================
@@ -380,10 +447,9 @@ st.caption(
 historial = cargar_historial()
 
 if not historial.empty:
-
     historial["Fecha"] = pd.to_datetime(
         historial["Fecha"],
-        errors="coerce"
+        errors="coerce",
     )
 
 # ============================================================
@@ -394,25 +460,30 @@ st.subheader("📁 Cargar INFOVENTAS")
 
 archivo = st.file_uploader(
     "Subí el INFOVENTAS del día",
-    type=["xlsx", "xls", "csv", "txt"]
+    type=[
+        "xlsx",
+        "xls",
+        "xlsm",
+        "csv",
+        "txt",
+    ],
 )
 
 if archivo is not None:
 
     try:
-
-        df_nuevo = leer_infoventas(archivo)
-
-        df_nuevo = preparar_datos(df_nuevo)
-
-        st.success(
-            f"Archivo cargado correctamente: "
-            f"{len(df_nuevo):,} operaciones."
+        df_nuevo = leer_infoventas(
+            archivo
         )
 
-        # ----------------------------------------------------
-        # FECHAS DEL ARCHIVO
-        # ----------------------------------------------------
+        df_nuevo = preparar_datos(
+            df_nuevo
+        )
+
+        st.success(
+            f"Archivo leído correctamente: "
+            f"{len(df_nuevo):,} filas."
+        )
 
         fechas_archivo = sorted(
             df_nuevo["Fecha"]
@@ -421,30 +492,56 @@ if archivo is not None:
             .unique()
         )
 
-        st.info(
-            "Fecha/s detectada/s: "
-            + ", ".join(
-                str(f)
-                for f in fechas_archivo
-            )
-        )
-
-        # ----------------------------------------------------
-        # GUARDAR HISTÓRICO
-        # ----------------------------------------------------
-
-        if github_configurado():
-
-            ids_nuevos = set(
-                df_nuevo["ID Operacion"]
+        if fechas_archivo:
+            st.info(
+                "Fecha/s detectada/s: "
+                + ", ".join(
+                    str(f)
+                    for f in fechas_archivo
+                )
             )
 
-            if not historial.empty:
+        # ====================================================
+        # GUARDADO AUTOMÁTICO
+        # ====================================================
+
+        if not github_configurado():
+
+            st.warning(
+                "⚠️ GitHub no está configurado en los Secrets. "
+                "El dashboard funciona, pero todavía no "
+                "guardará el histórico."
+            )
+
+        else:
+
+            if historial.empty:
+
+                df_para_agregar = df_nuevo.copy()
+
+            elif "_FirmaFila" in historial.columns:
+
+                firmas_existentes = set(
+                    historial["_FirmaFila"]
+                    .dropna()
+                    .astype(str)
+                )
+
+                df_para_agregar = df_nuevo[
+                    ~df_nuevo["_FirmaFila"].isin(
+                        firmas_existentes
+                    )
+                ].copy()
+
+            else:
 
                 ids_existentes = set(
-                    historial["ID Operacion"]
-                    if "ID Operacion" in historial.columns
-                    else []
+                    historial.get(
+                        "ID Operacion",
+                        pd.Series(dtype=str),
+                    )
+                    .dropna()
+                    .astype(str)
                 )
 
                 df_para_agregar = df_nuevo[
@@ -453,83 +550,72 @@ if archivo is not None:
                     )
                 ].copy()
 
-            else:
+            if not df_para_agregar.empty:
 
-                df_para_agregar = df_nuevo.copy()
-
-            if len(df_para_agregar) > 0:
-
-                if historial.empty:
-
-                    historial_actualizado = (
-                        df_para_agregar.copy()
-                    )
-
-                else:
+                with st.spinner(
+                    "Guardando automáticamente en el histórico..."
+                ):
 
                     historial_actualizado = pd.concat(
                         [
                             historial,
-                            df_para_agregar
+                            df_para_agregar,
                         ],
-                        ignore_index=True
+                        ignore_index=True,
                     )
 
-                historial_actualizado = (
-                    historial_actualizado
-                    .drop_duplicates(
-                        subset=["ID Operacion"]
-                    )
-                )
+                    if "_FirmaFila" in historial_actualizado.columns:
 
-                if st.button(
-                    "💾 Guardar este día en el histórico",
-                    type="primary"
-                ):
+                        historial_actualizado = (
+                            historial_actualizado
+                            .drop_duplicates(
+                                subset=["_FirmaFila"],
+                                keep="first",
+                            )
+                        )
 
-                    with st.spinner(
-                        "Guardando histórico..."
+                    elif "ID Operacion" in historial_actualizado.columns:
+
+                        historial_actualizado = (
+                            historial_actualizado
+                            .drop_duplicates(
+                                subset=["ID Operacion"],
+                                keep="first",
+                            )
+                        )
+
+                    if guardar_historial(
+                        historial_actualizado
                     ):
 
-                        if guardar_historial(
+                        historial = (
                             historial_actualizado
-                        ):
+                        )
 
-                            st.success(
-                                "✅ Día guardado correctamente."
-                            )
-
-                            historial = (
-                                historial_actualizado
-                            )
-
-                            st.rerun()
+                        st.success(
+                            f"✅ Guardado automático: "
+                            f"{len(df_para_agregar):,} "
+                            f"filas nuevas."
+                        )
 
             else:
 
-                st.warning(
-                    "⚠️ Este archivo ya está cargado "
-                    "en el histórico."
+                st.info(
+                    "ℹ️ Este archivo ya está cargado "
+                    "en el histórico. No se agregaron duplicados."
                 )
-
-        else:
-
-            st.warning(
-                "⚠️ El histórico todavía no está "
-                "configurado. El dashboard funciona, "
-                "pero todavía no guardará los días."
-            )
 
     except Exception as e:
 
         st.error(
-            f"Error procesando el archivo: {e}"
+            "❌ Error procesando el archivo: "
+            f"{e}"
         )
 
         st.stop()
 
 # ============================================================
-# ELEGIR DATOS PARA MOSTRAR
+# SIN HISTÓRICO
 # ============================================================
 
 if historial.empty:
@@ -540,12 +626,54 @@ if historial.empty:
 
     st.stop()
 
+# ============================================================
+# PREPARAR DATASET
+# ============================================================
+
 df = historial.copy()
 
 df["Fecha"] = pd.to_datetime(
     df["Fecha"],
-    errors="coerce"
+    errors="coerce",
 )
+
+for columna in [
+    "Suc.",
+    "Lista Utilizada",
+    "Nº Comprobante",
+]:
+    if columna not in df.columns:
+        df[columna] = ""
+
+# Si el histórico viejo no tiene estas columnas,
+# las reconstruimos para mantener compatibilidad.
+if "Resultado Venta-Costo $" not in df.columns:
+    df["Resultado Venta-Costo $"] = (
+        df["Total Venta"] - df["Total Costo"]
+    )
+
+if "Tipo Pago" not in df.columns:
+    forma = (
+        df["Forma Pago"]
+        .fillna("")
+        .astype(str)
+        .str.upper()
+    )
+
+    df["Tipo Pago"] = "OTRO"
+
+    df.loc[
+        forma.str.contains("CONTADO", na=False),
+        "Tipo Pago",
+    ] = "CONTADO"
+
+    df.loc[
+        forma.str.contains(
+            "CUENTA CORRIENTE",
+            na=False,
+        ),
+        "Tipo Pago",
+    ] = "CUENTA CORRIENTE"
 
 # ============================================================
 # FILTROS
@@ -553,128 +681,191 @@ df["Fecha"] = pd.to_datetime(
 
 st.sidebar.header("🔎 Filtros")
 
-fecha_min = df["Fecha"].min().date()
-fecha_max = df["Fecha"].max().date()
+fechas_validas = df["Fecha"].dropna()
+
+if fechas_validas.empty:
+
+    st.error(
+        "No hay fechas válidas en el histórico."
+    )
+
+    st.stop()
+
+fecha_min = fechas_validas.min().date()
+fecha_max = fechas_validas.max().date()
 
 rango_fechas = st.sidebar.date_input(
     "Período",
-    value=(fecha_min, fecha_max),
+    value=(
+        fecha_min,
+        fecha_max,
+    ),
     min_value=fecha_min,
-    max_value=fecha_max
+    max_value=fecha_max,
 )
 
-if isinstance(rango_fechas, tuple) and len(rango_fechas) == 2:
+if (
+    isinstance(rango_fechas, (tuple, list))
+    and len(rango_fechas) == 2
+):
 
     fecha_inicio = pd.Timestamp(
         rango_fechas[0]
     )
 
-    fecha_fin = pd.Timestamp(
-        rango_fechas[1]
-    ) + pd.Timedelta(days=1)
+    fecha_fin = (
+        pd.Timestamp(rango_fechas[1])
+        + pd.Timedelta(days=1)
+    )
 
     df = df[
         (df["Fecha"] >= fecha_inicio)
         & (df["Fecha"] < fecha_fin)
     ]
 
-# ------------------------------------------------------------
-# SUCURSAL
-# ------------------------------------------------------------
+# Sucursal
+sucursales = sorted(
+    df["Suc."]
+    .fillna("")
+    .astype(str)
+    .str.strip()
+    .replace("", pd.NA)
+    .dropna()
+    .unique()
+)
 
-if "Suc." in df.columns:
+sucursal = st.sidebar.multiselect(
+    "Sucursal",
+    sucursales,
+)
 
-    sucursales = sorted(
-        df["Suc."]
-        .dropna()
-        .astype(str)
-        .unique()
-    )
+if sucursal:
+    df = df[
+        df["Suc."].astype(str).isin(
+            sucursal
+        )
+    ]
 
-    sucursal = st.sidebar.multiselect(
-        "Sucursal",
-        sucursales
-    )
-
-    if sucursal:
-
-        df = df[
-            df["Suc."].astype(str).isin(
-                sucursal
-            )
-        ]
-
-# ------------------------------------------------------------
-# CLIENTE
-# ------------------------------------------------------------
-
+# Cliente
 clientes = sorted(
     df["Cliente"]
+    .fillna("")
+    .astype(str)
+    .str.strip()
+    .replace("", pd.NA)
     .dropna()
     .unique()
 )
 
 cliente = st.sidebar.multiselect(
     "Cliente",
-    clientes
+    clientes,
 )
 
 if cliente:
-
     df = df[
-        df["Cliente"].isin(cliente)
+        df["Cliente"].isin(
+            cliente
+        )
     ]
 
-# ------------------------------------------------------------
-# FORMA DE PAGO
-# ------------------------------------------------------------
+# Tipo de pago
+tipos_pago = sorted(
+    df["Tipo Pago"]
+    .fillna("OTRO")
+    .astype(str)
+    .unique()
+)
 
-pagos = sorted(
+tipo_pago = st.sidebar.multiselect(
+    "Tipo de pago",
+    tipos_pago,
+)
+
+if tipo_pago:
+    df = df[
+        df["Tipo Pago"].isin(
+            tipo_pago
+        )
+    ]
+
+# Forma exacta
+formas_pago = sorted(
     df["Forma Pago"]
+    .fillna("")
+    .astype(str)
+    .str.strip()
+    .replace("", pd.NA)
     .dropna()
     .unique()
 )
 
-pago = st.sidebar.multiselect(
-    "Forma de pago",
-    pagos
+forma_pago = st.sidebar.multiselect(
+    "Forma de pago exacta",
+    formas_pago,
 )
 
-if pago:
-
+if forma_pago:
     df = df[
-        df["Forma Pago"].isin(pago)
+        df["Forma Pago"].isin(
+            forma_pago
+        )
     ]
 
-# ------------------------------------------------------------
-# ARTÍCULO
-# ------------------------------------------------------------
+# Lista
+listas = sorted(
+    df["Lista Utilizada"]
+    .fillna("")
+    .astype(str)
+    .str.strip()
+    .replace("", pd.NA)
+    .dropna()
+    .unique()
+)
 
+lista = st.sidebar.multiselect(
+    "Lista utilizada",
+    listas,
+)
+
+if lista:
+    df = df[
+        df["Lista Utilizada"].isin(
+            lista
+        )
+    ]
+
+# Artículo
 articulos = sorted(
     df["Articulo"]
+    .fillna("")
+    .astype(str)
+    .str.strip()
+    .replace("", pd.NA)
     .dropna()
     .unique()
 )
 
 articulo = st.sidebar.multiselect(
     "Artículo",
-    articulos
+    articulos,
 )
 
 if articulo:
-
     df = df[
-        df["Articulo"].isin(articulo)
+        df["Articulo"].isin(
+            articulo
+        )
     ]
 
 # ============================================================
-# SI NO HAY DATOS
+# SIN RESULTADOS
 # ============================================================
 
 if df.empty:
 
     st.warning(
-        "No hay operaciones que coincidan "
+        "⚠️ No hay operaciones que coincidan "
         "con los filtros."
     )
 
@@ -688,20 +879,41 @@ total_venta = df["Total Venta"].sum()
 
 unidades = df["Cantidad"].sum()
 
-comprobantes = (
-    df["Nº Comprobante"].nunique()
-    if "Nº Comprobante" in df.columns
-    else len(df)
+comprobantes_validos = (
+    df["Nº Comprobante"]
+    .fillna("")
+    .astype(str)
+    .str.strip()
 )
 
-clientes_unicos = df["Cliente"].nunique()
+comprobantes = (
+    comprobantes_validos[
+        comprobantes_validos != ""
+    ].nunique()
+)
 
-articulos_unicos = df["Cod"].nunique()
+if comprobantes == 0:
+    comprobantes = len(df)
+
+clientes_unicos = (
+    df["Cliente"]
+    .replace("", pd.NA)
+    .dropna()
+    .nunique()
+)
+
+articulos_unicos = (
+    df["Cod"]
+    .replace("", pd.NA)
+    .dropna()
+    .nunique()
+)
+
+cantidad_total = df["Cantidad"].sum()
 
 precio_promedio = (
-    df["Total Venta"].sum()
-    / df["Cantidad"].sum()
-    if df["Cantidad"].sum() != 0
+    total_venta / cantidad_total
+    if cantidad_total != 0
     else 0
 )
 
@@ -711,348 +923,678 @@ ticket_promedio = (
     else 0
 )
 
-rentabilidad_total = df["Rentabilidad $"].sum()
+resultado_total = (
+    df["Resultado Venta-Costo $"].sum()
+)
 
 rentabilidad_promedio = (
     df["Rentabilidad"].mean()
+    if len(df) > 0
+    else 0
 )
 
 # ============================================================
-# TABLA PRINCIPAL DE KPIs
+# RESUMEN SUPERIOR
 # ============================================================
 
 st.subheader("📌 Resumen")
 
-col1, col2, col3, col4 = st.columns(4)
+c1, c2, c3, c4 = st.columns(4)
 
-col1.metric(
+c1.metric(
     "💰 Facturación",
-    f"$ {total_venta:,.2f}"
+    formato_pesos(total_venta),
 )
 
-col2.metric(
+c2.metric(
     "📦 Unidades",
-    f"{unidades:,.0f}"
+    f"{unidades:,.0f}",
 )
 
-col3.metric(
+c3.metric(
     "🧾 Comprobantes",
-    f"{comprobantes:,}"
+    f"{comprobantes:,}",
 )
 
-col4.metric(
+c4.metric(
     "👥 Clientes",
-    f"{clientes_unicos:,}"
+    f"{clientes_unicos:,}",
 )
 
-col5, col6, col7, col8 = st.columns(4)
+c5, c6, c7, c8 = st.columns(4)
 
-col5.metric(
+c5.metric(
     "💵 Precio promedio",
-    f"$ {precio_promedio:,.2f}"
+    formato_pesos(precio_promedio),
 )
 
-col6.metric(
+c6.metric(
     "🛒 Ticket promedio",
-    f"$ {ticket_promedio:,.2f}"
+    formato_pesos(ticket_promedio),
 )
 
-col7.metric(
-    "📈 Rentabilidad promedio",
-    f"{rentabilidad_promedio:.2f}%"
+c7.metric(
+    "📈 Rentabilidad % promedio",
+    f"{rentabilidad_promedio:.2f}%",
 )
 
-col8.metric(
-    "💰 Rentabilidad $",
-    f"$ {rentabilidad_total:,.2f}"
+c8.metric(
+    "💰 Venta - Costo",
+    formato_pesos(resultado_total),
+)
+
+st.caption(
+    "Rentabilidad % = columna original de INFOVENTAS. "
+    "Venta - Costo = diferencia matemática entre ambas columnas."
 )
 
 st.divider()
 
 # ============================================================
-# RANKING ARTÍCULOS
+# TABS
 # ============================================================
 
-st.subheader("🏆 Ranking de artículos")
-
-ranking_articulos = (
-    df.groupby(
-        ["Cod", "Articulo"],
-        as_index=False
-    )
-    .agg(
-        Unidades=("Cantidad", "sum"),
-        Facturacion=("Total Venta", "sum"),
-        Rentabilidad=("Rentabilidad $", "sum"),
-        Rentabilidad_Promedio=("Rentabilidad", "mean")
-    )
-    .sort_values(
-        "Facturacion",
-        ascending=False
-    )
-)
-
-tab1, tab2, tab3, tab4 = st.tabs(
+tab_resumen, tab_articulos, tab_clientes, tab_pagos, tab_evolucion, tab_detalle = st.tabs(
     [
-        "💰 Facturación",
-        "📦 Cantidad",
-        "📈 Rentabilidad $",
-        "%",
+        "📊 Resumen",
+        "🔧 Artículos",
+        "👥 Compradores",
+        "💳 Pagos",
+        "📅 Evolución",
+        "📋 Detalle",
     ]
 )
 
-with tab1:
+# ============================================================
+# RESUMEN
+# ============================================================
 
-    st.dataframe(
-        ranking_articulos[
-            [
-                "Cod",
-                "Articulo",
-                "Unidades",
-                "Facturacion",
-                "Rentabilidad_Promedio"
-            ]
-        ].head(30),
-        use_container_width=True
+with tab_resumen:
+
+    st.subheader(
+        "📊 Principales indicadores"
     )
 
-with tab2:
+    resumen = pd.DataFrame(
+        {
+            "Indicador": [
+                "Facturación",
+                "Unidades",
+                "Comprobantes",
+                "Clientes",
+                "Artículos",
+                "Precio promedio",
+                "Ticket promedio",
+                "Rentabilidad % promedio",
+                "Venta - Costo",
+            ],
+            "Valor": [
+                formato_pesos(total_venta),
+                f"{unidades:,.0f}",
+                f"{comprobantes:,}",
+                f"{clientes_unicos:,}",
+                f"{articulos_unicos:,}",
+                formato_pesos(precio_promedio),
+                formato_pesos(ticket_promedio),
+                f"{rentabilidad_promedio:.2f}%",
+                formato_pesos(resultado_total),
+            ],
+        }
+    )
 
     st.dataframe(
+        resumen,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+# ============================================================
+# ARTÍCULOS
+# ============================================================
+
+with tab_articulos:
+
+    st.subheader(
+        "🔧 Ranking de artículos"
+    )
+
+    ranking_articulos = (
+        df.groupby(
+            ["Cod", "Articulo"],
+            as_index=False,
+            dropna=False,
+        )
+        .agg(
+            Unidades=("Cantidad", "sum"),
+            Facturacion=("Total Venta", "sum"),
+            Resultado=("Resultado Venta-Costo $", "sum"),
+            Rentabilidad_Promedio=("Rentabilidad", "mean"),
+            Operaciones=("Cod", "size"),
+        )
+        .sort_values(
+            "Facturacion",
+            ascending=False,
+        )
+        .reset_index(drop=True)
+    )
+
+    ranking_articulos.insert(
+        0,
+        "Puesto",
+        range(
+            1,
+            len(ranking_articulos) + 1,
+        ),
+    )
+
+    vista = ranking_articulos.copy()
+
+    vista["Facturación"] = (
+        vista["Facturacion"]
+        .apply(formato_pesos)
+    )
+
+    vista["Resultado $"] = (
+        vista["Resultado"]
+        .apply(formato_pesos)
+    )
+
+    vista["Rentabilidad %"] = (
+        vista["Rentabilidad_Promedio"]
+        .apply(
+            lambda x: f"{x:.2f}%"
+        )
+    )
+
+    vista = vista[
+        [
+            "Puesto",
+            "Cod",
+            "Articulo",
+            "Unidades",
+            "Facturación",
+            "Resultado $",
+            "Rentabilidad %",
+            "Operaciones",
+        ]
+    ]
+
+    st.dataframe(
+        vista.head(50),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.subheader(
+        "📊 Artículos con mayor facturación"
+    )
+
+    grafico = (
+        ranking_articulos
+        .sort_values(
+            "Facturacion",
+            ascending=False,
+        )
+        .head(15)
+        .copy()
+    )
+
+    grafico["Artículo"] = (
+        grafico["Cod"]
+        + " - "
+        + grafico["Articulo"]
+    )
+
+    st.bar_chart(
+        grafico.set_index(
+            "Artículo"
+        )["Facturacion"]
+    )
+
+    st.subheader(
+        "📦 Artículos por cantidad"
+    )
+
+    grafico_cantidad = (
         ranking_articulos
         .sort_values(
             "Unidades",
-            ascending=False
+            ascending=False,
         )
-        [
-            [
-                "Cod",
-                "Articulo",
-                "Unidades",
-                "Facturacion"
-            ]
-        ]
-        .head(30),
-        use_container_width=True
+        .head(15)
+        .copy()
     )
 
-with tab3:
-
-    st.dataframe(
-        ranking_articulos
-        .sort_values(
-            "Rentabilidad",
-            ascending=False
-        )
-        [
-            [
-                "Cod",
-                "Articulo",
-                "Facturacion",
-                "Rentabilidad"
-            ]
-        ]
-        .head(30),
-        use_container_width=True
+    grafico_cantidad["Artículo"] = (
+        grafico_cantidad["Cod"]
+        + " - "
+        + grafico_cantidad["Articulo"]
     )
 
-with tab4:
-
-    st.dataframe(
-        ranking_articulos
-        .sort_values(
-            "Rentabilidad_Promedio",
-            ascending=False
-        )
-        [
-            [
-                "Cod",
-                "Articulo",
-                "Rentabilidad_Promedio"
-            ]
-        ]
-        .head(30),
-        use_container_width=True
+    st.bar_chart(
+        grafico_cantidad.set_index(
+            "Artículo"
+        )["Unidades"]
     )
-
-# ============================================================
-# GRÁFICO ARTÍCULOS
-# ============================================================
-
-st.subheader("📊 Artículos con mayor facturación")
-
-grafico_articulos = (
-    ranking_articulos
-    .sort_values(
-        "Facturacion",
-        ascending=False
-    )
-    .head(15)
-    .copy()
-)
-
-grafico_articulos["Nombre"] = (
-    grafico_articulos["Cod"]
-    + " - "
-    + grafico_articulos["Articulo"]
-)
-
-st.bar_chart(
-    grafico_articulos.set_index(
-        "Nombre"
-    )["Facturacion"]
-)
 
 # ============================================================
 # CLIENTES
 # ============================================================
 
-st.subheader("👥 Ranking de clientes")
+with tab_clientes:
 
-ranking_clientes = (
-    df.groupby(
-        "Cliente",
-        as_index=False
+    st.subheader(
+        "👥 Ranking de compradores"
     )
-    .agg(
-        Facturacion=("Total Venta", "sum"),
-        Unidades=("Cantidad", "sum"),
-        Rentabilidad=("Rentabilidad $", "sum"),
-        Rentabilidad_Promedio=("Rentabilidad", "mean"),
-        Operaciones=("Cliente", "size")
-    )
-    .sort_values(
-        "Facturacion",
-        ascending=False
-    )
-)
 
-st.dataframe(
-    ranking_clientes.head(30),
-    use_container_width=True
-)
-
-# ============================================================
-# GRÁFICO CLIENTES
-# ============================================================
-
-grafico_clientes = (
-    ranking_clientes
-    .head(15)
-    .copy()
-)
-
-st.bar_chart(
-    grafico_clientes.set_index(
-        "Cliente"
-    )["Facturacion"]
-)
-
-# ============================================================
-# FORMA DE PAGO
-# ============================================================
-
-st.subheader("💳 Forma de pago")
-
-ranking_pago = (
-    df.groupby(
-        "Forma Pago",
-        as_index=False
-    )
-    .agg(
-        Facturacion=("Total Venta", "sum"),
-        Unidades=("Cantidad", "sum"),
-        Rentabilidad=("Rentabilidad $", "sum")
-    )
-    .sort_values(
-        "Facturacion",
-        ascending=False
-    )
-)
-
-st.dataframe(
-    ranking_pago,
-    use_container_width=True
-)
-
-st.bar_chart(
-    ranking_pago.set_index(
-        "Forma Pago"
-    )["Facturacion"]
-)
-
-# ============================================================
-# VENTAS POR DÍA
-# ============================================================
-
-st.subheader("📅 Evolución de ventas")
-
-ventas_dia = (
-    df.groupby(
-        df["Fecha"].dt.date
-    )
-    .agg(
-        Facturacion=("Total Venta", "sum"),
-        Unidades=("Cantidad", "sum"),
-        Rentabilidad=("Rentabilidad $", "sum")
-    )
-)
-
-st.line_chart(
-    ventas_dia[
-        [
+    ranking_clientes = (
+        df.groupby(
+            "Cliente",
+            as_index=False,
+            dropna=False,
+        )
+        .agg(
+            Facturacion=("Total Venta", "sum"),
+            Unidades=("Cantidad", "sum"),
+            Resultado=("Resultado Venta-Costo $", "sum"),
+            Rentabilidad_Promedio=("Rentabilidad", "mean"),
+            Operaciones=("Cliente", "size"),
+        )
+        .sort_values(
             "Facturacion",
-            "Rentabilidad"
+            ascending=False,
+        )
+        .reset_index(drop=True)
+    )
+
+    ranking_clientes.insert(
+        0,
+        "Puesto",
+        range(
+            1,
+            len(ranking_clientes) + 1,
+        ),
+    )
+
+    vista = ranking_clientes.copy()
+
+    vista["Facturación"] = (
+        vista["Facturacion"]
+        .apply(formato_pesos)
+    )
+
+    vista["Resultado $"] = (
+        vista["Resultado"]
+        .apply(formato_pesos)
+    )
+
+    vista["Rentabilidad %"] = (
+        vista["Rentabilidad_Promedio"]
+        .apply(
+            lambda x: f"{x:.2f}%"
+        )
+    )
+
+    vista = vista[
+        [
+            "Puesto",
+            "Cliente",
+            "Facturación",
+            "Unidades",
+            "Resultado $",
+            "Rentabilidad %",
+            "Operaciones",
         ]
     ]
-)
+
+    # IMPORTANTE:
+    # hide_index=True elimina el número automático
+    # que aparecía a la izquierda de la tabla.
+    st.dataframe(
+        vista.head(50),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.subheader(
+        "📊 Compradores con mayor facturación"
+    )
+
+    grafico = (
+        ranking_clientes
+        .head(15)
+        .copy()
+    )
+
+    st.bar_chart(
+        grafico.set_index(
+            "Cliente"
+        )["Facturacion"]
+    )
 
 # ============================================================
-# TABLA DE OPERACIONES
+# PAGOS
 # ============================================================
 
-st.subheader("📋 Detalle de operaciones")
+with tab_pagos:
 
-columnas_mostrar = [
-    "Fecha",
-    "Cod",
-    "Articulo",
-    "Cantidad",
-    "Cliente",
-    "Precio Unitario",
-    "Total Venta",
-    "Forma Pago",
-    "Rentabilidad",
-    "Rentabilidad $"
-]
+    st.subheader(
+        "💳 Contado vs cuenta corriente"
+    )
 
-columnas_mostrar = [
-    c for c in columnas_mostrar
-    if c in df.columns
-]
+    ranking_tipo_pago = (
+        df.groupby(
+            "Tipo Pago",
+            as_index=False,
+        )
+        .agg(
+            Facturacion=("Total Venta", "sum"),
+            Unidades=("Cantidad", "sum"),
+            Operaciones=("Tipo Pago", "size"),
+        )
+        .sort_values(
+            "Facturacion",
+            ascending=False,
+        )
+        .reset_index(drop=True)
+    )
 
-st.dataframe(
-    df[columnas_mostrar]
-    .sort_values(
+    ranking_tipo_pago.insert(
+        0,
+        "Puesto",
+        range(
+            1,
+            len(ranking_tipo_pago) + 1,
+        ),
+    )
+
+    vista = ranking_tipo_pago.copy()
+
+    vista["Facturación"] = (
+        vista["Facturacion"]
+        .apply(formato_pesos)
+    )
+
+    st.dataframe(
+        vista[
+            [
+                "Puesto",
+                "Tipo Pago",
+                "Facturación",
+                "Unidades",
+                "Operaciones",
+            ]
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.subheader(
+        "📊 Facturación por tipo de pago"
+    )
+
+    st.bar_chart(
+        ranking_tipo_pago.set_index(
+            "Tipo Pago"
+        )["Facturacion"]
+    )
+
+    st.subheader(
+        "🥧 Distribución de facturación"
+    )
+
+    try:
+        import plotly.express as px
+
+        pie = ranking_tipo_pago[
+            ranking_tipo_pago["Facturacion"] != 0
+        ].copy()
+
+        if not pie.empty:
+
+            fig = px.pie(
+                pie,
+                names="Tipo Pago",
+                values="Facturacion",
+                hole=0.35,
+            )
+
+            fig.update_layout(
+                margin=dict(
+                    l=10,
+                    r=10,
+                    t=30,
+                    b=10,
+                ),
+            )
+
+            st.plotly_chart(
+                fig,
+                use_container_width=True,
+            )
+
+        else:
+
+            st.info(
+                "No hay facturación distinta de cero "
+                "para mostrar."
+            )
+
+    except ImportError:
+
+        st.warning(
+            "Falta Plotly. Verificá requirements.txt."
+        )
+
+    st.subheader(
+        "💳 Formas de pago exactas"
+    )
+
+    ranking_forma_pago = (
+        df.groupby(
+            "Forma Pago",
+            as_index=False,
+        )
+        .agg(
+            Facturacion=("Total Venta", "sum"),
+            Unidades=("Cantidad", "sum"),
+        )
+        .sort_values(
+            "Facturacion",
+            ascending=False,
+        )
+        .reset_index(drop=True)
+    )
+
+    ranking_forma_pago["Facturación"] = (
+        ranking_forma_pago["Facturacion"]
+        .apply(formato_pesos)
+    )
+
+    st.dataframe(
+        ranking_forma_pago[
+            [
+                "Forma Pago",
+                "Facturación",
+                "Unidades",
+            ]
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+# ============================================================
+# EVOLUCIÓN
+# ============================================================
+
+with tab_evolucion:
+
+    st.subheader(
+        "📅 Evolución diaria"
+    )
+
+    ventas_dia = (
+        df.assign(
+            DiaFecha=df["Fecha"].dt.date
+        )
+        .groupby(
+            "DiaFecha",
+            as_index=False,
+        )
+        .agg(
+            Facturacion=("Total Venta", "sum"),
+            Unidades=("Cantidad", "sum"),
+            Resultado=("Resultado Venta-Costo $", "sum"),
+        )
+        .sort_values(
+            "DiaFecha"
+        )
+    )
+
+    st.line_chart(
+        ventas_dia.set_index(
+            "DiaFecha"
+        )[
+            ["Facturacion"]
+        ]
+    )
+
+    st.subheader(
+        "📦 Unidades por día"
+    )
+
+    st.line_chart(
+        ventas_dia.set_index(
+            "DiaFecha"
+        )[
+            ["Unidades"]
+        ]
+    )
+
+    vista = ventas_dia.copy()
+
+    vista["Facturación"] = (
+        vista["Facturacion"]
+        .apply(formato_pesos)
+    )
+
+    vista["Resultado $"] = (
+        vista["Resultado"]
+        .apply(formato_pesos)
+    )
+
+    st.dataframe(
+        vista[
+            [
+                "DiaFecha",
+                "Facturación",
+                "Unidades",
+                "Resultado $",
+            ]
+        ].sort_values(
+            "DiaFecha",
+            ascending=False,
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+# ============================================================
+# DETALLE
+# ============================================================
+
+with tab_detalle:
+
+    st.subheader(
+        "📋 Detalle de operaciones"
+    )
+
+    columnas_mostrar = [
         "Fecha",
-        ascending=False
-    ),
-    use_container_width=True
-)
+        "Cod",
+        "Articulo",
+        "Cantidad",
+        "Cliente",
+        "Precio Unitario",
+        "Total Venta",
+        "Forma Pago",
+        "Tipo Pago",
+        "Rentabilidad",
+        "Resultado Venta-Costo $",
+    ]
 
-# ============================================================
-# DESCARGAR DATOS FILTRADOS
-# ============================================================
+    columnas_mostrar = [
+        c
+        for c in columnas_mostrar
+        if c in df.columns
+    ]
 
-st.subheader("⬇️ Descargar")
+    detalle = (
+        df[columnas_mostrar]
+        .sort_values(
+            "Fecha",
+            ascending=False,
+        )
+        .reset_index(drop=True)
+    )
 
-csv = df.to_csv(
-    index=False
-).encode("utf-8-sig")
+    detalle.insert(
+        0,
+        "Nº",
+        range(
+            1,
+            len(detalle) + 1,
+        ),
+    )
 
-st.download_button(
-    "📥 Descargar datos filtrados",
-    data=csv,
-    file_name="ventas_filtradas.csv",
-    mime="text/csv"
-)
+    detalle["Fecha"] = (
+        detalle["Fecha"]
+        .dt.strftime("%d/%m/%Y")
+    )
+
+    for columna in [
+        "Precio Unitario",
+        "Total Venta",
+        "Resultado Venta-Costo $",
+    ]:
+
+        if columna in detalle.columns:
+            detalle[columna] = (
+                detalle[columna]
+                .apply(formato_pesos)
+            )
+
+    if "Rentabilidad" in detalle.columns:
+
+        detalle["Rentabilidad"] = (
+            detalle["Rentabilidad"]
+            .apply(
+                lambda x: f"{x:.2f}%"
+            )
+        )
+
+    st.dataframe(
+        detalle,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    # Descargar sin columnas internas.
+    csv = (
+        df.drop(
+            columns=[
+                "_FilaArchivo",
+                "_FirmaFila",
+            ],
+            errors="ignore",
+        )
+        .to_csv(index=False)
+        .encode("utf-8-sig")
+    )
+
+    st.download_button(
+        "📥 Descargar datos filtrados",
+        data=csv,
+        file_name="ventas_filtradas.csv",
+        mime="text/csv",
+    )
