@@ -86,6 +86,12 @@ NARANJA = "#F59E0B"
 GRIS = "#64748B"
 PALETA = [AZUL, VERDE, NARANJA, "#7C3AED", "#0891B2", ROJO, GRIS]
 
+PALETA_LARGA = [
+    "#2563EB", "#16A34A", "#F59E0B", "#7C3AED", "#0891B2",
+    "#DB2777", "#65A30D", "#EA580C", "#0F766E", "#4F46E5",
+]
+COLOR_OTROS = "#CBD5E1"
+
 # Colores fijos por forma de pago: cada una se distingue en todos los gráficos
 COLORES_TIPO_PAGO = {
     "CONTADO": VERDE,
@@ -667,22 +673,97 @@ def grafico_barras_horizontal(etiquetas, valores, titulo, formato, color=AZUL, a
     return fig
 
 
-def grafico_dona(etiquetas, valores, titulo, colores=None):
+def grafico_dona(etiquetas, valores, titulo, colores=None, nombres=None,
+                 leyenda="h", alto=400, formato=formato_pesos, centro=None):
+    """
+    Dona con el total en el centro. Con leyenda="v" la leyenda queda a la
+    derecha (mejor cuando hay muchas porciones).
+    """
+    etiquetas = list(etiquetas)
+    valores = list(valores)
+    nombres = list(nombres) if nombres is not None else etiquetas
+    total = sum(valores)
+
+    vertical = leyenda == "v"
+    dominio_x = [0.0, 0.58] if vertical else [0.0, 1.0]
+
     fig = go.Figure(
         go.Pie(
-            labels=list(etiquetas),
-            values=list(valores),
-            hole=0.55,
+            labels=etiquetas,
+            values=valores,
+            hole=0.58,
             sort=False,
-            marker=dict(colors=colores or PALETA, line=dict(color="white", width=2)),
+            direction="clockwise",
+            domain=dict(x=dominio_x, y=[0.0, 1.0] if vertical else [0.1, 1.0]),
+            marker=dict(colors=colores or PALETA_LARGA, line=dict(color="white", width=2)),
             textinfo="percent",
-            textfont=dict(size=14),
-            hovertemplate="<b>%{label}</b><br>%{value:,.2f}<br>%{percent}<extra></extra>",
+            textposition="inside",
+            insidetextorientation="horizontal",
+            textfont=dict(size=13, color="white"),
+            customdata=[[n, formato(v)] for n, v in zip(nombres, valores)],
+            hovertemplate="<b>%{customdata[0]}</b><br>%{customdata[1]}<br>%{percent}<extra></extra>",
         )
     )
-    fig = _layout_base(fig, titulo, 400)
-    fig.update_layout(legend=dict(orientation="h", y=-0.05, x=0.5, xanchor="center"))
+    fig = _layout_base(fig, titulo, alto)
+
+    if vertical:
+        fig.update_layout(
+            legend=dict(orientation="v", x=0.62, y=0.5, xanchor="left", yanchor="middle",
+                        font=dict(size=12)),
+            margin=dict(l=10, r=10, t=60, b=20),
+        )
+    else:
+        fig.update_layout(
+            legend=dict(orientation="h", y=-0.02, x=0.5, xanchor="center"),
+        )
+
+    fig.add_annotation(
+        x=sum(dominio_x) / 2,
+        y=0.5 if vertical else 0.55,
+        xref="paper",
+        yref="paper",
+        text=centro or f"<b>{formato(total)}</b><br><span style='font-size:11px;color:#64748B'>total</span>",
+        showarrow=False,
+        font=dict(size=15),
+    )
     return fig
+
+
+def dona_top(nombres, valores, titulo, n=8, largo=26, alto=430, formato=formato_pesos):
+    """Dona con los N mayores y el resto agrupado en 'Otros'. None si no hay datos positivos."""
+    datos = pd.DataFrame({"nombre": list(nombres), "valor": list(valores)})
+    datos = datos[datos["valor"] > 0].sort_values("valor", ascending=False)
+    if datos.empty:
+        return None
+
+    top = datos.head(n)
+    resto = datos["valor"].iloc[n:].sum()
+
+    completos = list(top["nombre"].astype(str))
+    vals = list(top["valor"])
+    cortos = [
+        f"{i + 1}. " + textwrap.shorten(x, width=largo, placeholder="…")
+        for i, x in enumerate(completos)
+    ]
+    colores = [PALETA_LARGA[i % len(PALETA_LARGA)] for i in range(len(top))]
+
+    if resto > 0:
+        completos.append("Otros")
+        cortos.append("Otros")
+        vals.append(resto)
+        colores.append(COLOR_OTROS)
+
+    return grafico_dona(
+        cortos, vals, titulo, colores=colores, nombres=completos,
+        leyenda="v", alto=alto, formato=formato,
+    )
+
+
+def mostrar_dona(fig, clave):
+    if fig is None:
+        st.info("No hay datos positivos para este gráfico.")
+    else:
+        mostrar_grafico(fig, clave)
 
 
 def mostrar_grafico(fig, clave):
@@ -692,6 +773,21 @@ def mostrar_grafico(fig, clave):
         config=CONFIG_GRAFICO,
         key=clave,
     )
+
+
+def guardar_nuevas(historial, df_para_agregar):
+    """Agrega solo filas nuevas al histórico y lo guarda. Devuelve el histórico vigente."""
+    with st.spinner("Guardando automáticamente en el histórico..."):
+        if historial.empty:
+            actualizado = df_para_agregar.copy()
+        else:
+            actualizado = pd.concat([historial, df_para_agregar], ignore_index=True)
+        actualizado = actualizado.drop_duplicates(subset=["_Clave"], keep="first")
+
+        if guardar_historial(actualizado):
+            st.success(f"✅ Guardado: {formato_entero(len(df_para_agregar))} filas nuevas.")
+            return actualizado
+    return historial
 
 
 # ============================================================
@@ -743,29 +839,40 @@ if archivo is not None:
                 "El panel funciona, pero todavía no guardará el histórico."
             )
         else:
+            total_archivo = len(df_nuevo)
+
             if historial.empty:
-                df_para_agregar = df_nuevo.copy()
+                repetida = pd.Series(False, index=df_nuevo.index)
             else:
-                existentes = set(historial["_Clave"])
-                df_para_agregar = df_nuevo[~df_nuevo["_Clave"].isin(existentes)].copy()
+                repetida = df_nuevo["_Clave"].isin(set(historial["_Clave"]))
 
-            if not df_para_agregar.empty:
-                with st.spinner("Guardando automáticamente en el histórico..."):
-                    historial_actualizado = pd.concat(
-                        [historial, df_para_agregar], ignore_index=True
-                    ).drop_duplicates(subset=["_Clave"], keep="first")
+            ya_cargadas = int(repetida.sum())
+            df_para_agregar = df_nuevo[~repetida].copy()
+            nuevas = len(df_para_agregar)
 
-                    if guardar_historial(historial_actualizado):
-                        historial = historial_actualizado
-                        st.success(
-                            "✅ Guardado automático: "
-                            f"{len(df_para_agregar):,} filas nuevas.".replace(",", ".")
-                        )
-            else:
+            if nuevas == 0:
                 st.info(
-                    "ℹ️ Este archivo ya está cargado en el histórico. "
-                    "No se agregaron duplicados."
+                    "ℹ️ Este archivo ya estaba cargado completo "
+                    f"({formato_entero(total_archivo)} filas). No se sumó nada: "
+                    "las ventas no se duplican."
                 )
+            elif ya_cargadas == 0:
+                historial = guardar_nuevas(historial, df_para_agregar)
+            else:
+                # Parte del archivo ya estaba y parte no: se pide confirmación.
+                fechas_rep = sorted(df_nuevo.loc[repetida, "Fecha"].dt.date.unique())
+                dias = ", ".join(f.strftime("%d/%m/%Y") for f in fechas_rep)
+                st.warning(
+                    f"⚠️ {formato_entero(ya_cargadas)} de {formato_entero(total_archivo)} "
+                    f"filas de este archivo ya estaban cargadas (fechas: {dias}) y se van "
+                    f"a ignorar. Hay {formato_entero(nuevas)} filas que todavía no estaban. "
+                    "Si subiste el archivo por error o fue modificado, revisalo antes de guardar."
+                )
+                if st.button(
+                    f"Guardar solo las {nuevas} filas nuevas",
+                    key=f"guardar_{archivo.name}_{archivo.size}",
+                ):
+                    historial = guardar_nuevas(historial, df_para_agregar)
 
     except Exception as e:
         st.error(f"❌ Error procesando el archivo: {e}")
@@ -1010,6 +1117,48 @@ with tab_resumen:
         )
         mostrar_grafico(fig, "grafico_cascada")
 
+    st.subheader("🥧 Cómo se reparte la venta")
+
+    por_forma = resumen_por(df, ["Forma Pago"])
+    por_articulo = resumen_por(df, ["Cod", "Articulo"])
+    por_articulo["Nombre"] = por_articulo["Cod"] + " - " + por_articulo["Articulo"]
+    por_cliente = resumen_por(df, ["Cliente"])
+
+    r1a, r1b = st.columns(2)
+    with r1a:
+        positivas_forma = por_forma[por_forma["Venta_Neta"] > 0]
+        if positivas_forma.empty:
+            st.info("No hay venta neta positiva.")
+        else:
+            mostrar_grafico(
+                grafico_dona(
+                    positivas_forma["Forma Pago"],
+                    positivas_forma["Venta_Neta"],
+                    "Venta neta por forma de pago",
+                    colores=[color_pago(f) for f in positivas_forma["Forma Pago"]],
+                    leyenda="v",
+                    alto=430,
+                ),
+                "resumen_dona_forma_pago",
+            )
+    with r1b:
+        mostrar_dona(
+            dona_top(por_articulo["Nombre"], por_articulo["Venta_Neta"], "Venta por artículo (top 8)"),
+            "resumen_dona_articulos",
+        )
+
+    r2a, r2b = st.columns(2)
+    with r2a:
+        mostrar_dona(
+            dona_top(por_cliente["Cliente"], por_cliente["Venta_Neta"], "Venta por comprador (top 8)"),
+            "resumen_dona_clientes",
+        )
+    with r2b:
+        mostrar_dona(
+            dona_top(por_articulo["Nombre"], por_articulo["Resultado"], "Ganancia por artículo (top 8)"),
+            "resumen_dona_ganancia",
+        )
+
 # ============================================================
 # ARTÍCULOS
 # ============================================================
@@ -1046,6 +1195,64 @@ with tab_articulos:
             "Artículo": st.column_config.TextColumn("Artículo", width="large"),
         },
     )
+
+    nombres_art = ranking_articulos["Cod"] + " - " + ranking_articulos["Articulo"]
+
+    ca, cb = st.columns(2)
+    with ca:
+        mostrar_dona(
+            dona_top(nombres_art, ranking_articulos["Venta_Neta"], "Participación en la venta (top 10)", n=10, alto=470),
+            "art_dona_venta",
+        )
+    with cb:
+        mostrar_dona(
+            dona_top(
+                nombres_art, ranking_articulos["Unidades"], "Participación en unidades (top 10)",
+                n=10, alto=470, formato=formato_entero,
+            ),
+            "art_dona_unidades",
+        )
+
+    top_tree = ranking_articulos[ranking_articulos["Venta_Neta"] > 0].head(30)
+    if not top_tree.empty:
+        fig = go.Figure(
+            go.Treemap(
+                ids=[str(i) for i in range(len(top_tree))],
+                labels=[
+                    etiqueta_articulo(c, a, ancho=20)
+                    for c, a in zip(top_tree["Cod"], top_tree["Articulo"])
+                ],
+                parents=[""] * len(top_tree),
+                values=list(top_tree["Venta_Neta"]),
+                customdata=[
+                    [f"{c} - {a}", formato_pesos(v), formato_porcentaje(r)]
+                    for c, a, v, r in zip(
+                        top_tree["Cod"], top_tree["Articulo"],
+                        top_tree["Venta_Neta"], top_tree["Rentabilidad"],
+                    )
+                ],
+                hovertemplate=(
+                    "<b>%{customdata[0]}</b><br>Venta neta: %{customdata[1]}"
+                    "<br>Rentabilidad: %{customdata[2]}<extra></extra>"
+                ),
+                marker=dict(
+                    colors=list(top_tree["Rentabilidad"]),
+                    colorscale="RdYlGn",
+                    cmid=0,
+                    colorbar=dict(title="Rentab. %", thickness=14),
+                    line=dict(color="white", width=2),
+                ),
+                textfont=dict(size=13),
+                textposition="middle center",
+            )
+        )
+        fig = _layout_base(
+            fig,
+            "Mapa de artículos: tamaño = venta neta, color = rentabilidad (verde más rentable)",
+            560,
+        )
+        fig.update_layout(margin=dict(l=10, r=10, t=60, b=10))
+        mostrar_grafico(fig, "art_treemap")
 
     top_venta = ranking_articulos[ranking_articulos["Venta_Neta"] > 0].head(15)
     if not top_venta.empty:
@@ -1113,6 +1320,20 @@ with tab_clientes:
     )
 
     st.dataframe(vista.head(100), use_container_width=True, hide_index=True)
+
+    cc1, cc2 = st.columns(2)
+    with cc1:
+        mostrar_dona(
+            dona_top(ranking_clientes["Cliente"], ranking_clientes["Venta_Neta"],
+                     "Participación en la venta (top 10)", n=10, alto=470),
+            "cli_dona_venta",
+        )
+    with cc2:
+        mostrar_dona(
+            dona_top(ranking_clientes["Cliente"], ranking_clientes["Resultado"],
+                     "Participación en la ganancia (top 10)", n=10, alto=470),
+            "cli_dona_ganancia",
+        )
 
     top_clientes = ranking_clientes[ranking_clientes["Venta_Neta"] > 0].head(15)
     if not top_clientes.empty:
@@ -1231,6 +1452,31 @@ with tab_pagos:
             fig.update_layout(height=400)
             mostrar_grafico(fig, "grafico_forma_pago")
 
+        col_e, col_f = st.columns(2)
+
+        with col_e:
+            un = ranking_forma[ranking_forma["Unidades"] > 0]
+            if not un.empty:
+                mostrar_grafico(
+                    grafico_dona(
+                        un["Forma Pago"], un["Unidades"], "Unidades por forma de pago",
+                        colores=[color_pago(f) for f in un["Forma Pago"]],
+                        formato=formato_entero,
+                    ),
+                    "dona_unidades_forma_pago",
+                )
+
+        with col_f:
+            ga = ranking_forma[ranking_forma["Resultado"] > 0]
+            if not ga.empty:
+                mostrar_grafico(
+                    grafico_dona(
+                        ga["Forma Pago"], ga["Resultado"], "Ganancia por forma de pago",
+                        colores=[color_pago(f) for f in ga["Forma Pago"]],
+                    ),
+                    "dona_ganancia_forma_pago",
+                )
+
 # ============================================================
 # EVOLUCIÓN
 # ============================================================
@@ -1320,6 +1566,22 @@ with tab_evolucion:
         tickformat=",.0f", fixedrange=True, showgrid=True, gridcolor="#E2E8F0"
     )
     mostrar_grafico(fig, "grafico_evolucion_pago")
+
+    semana = resumen_por(
+        df.assign(Semana=df["Fecha"].dt.dayofweek.map(DIAS_SEMANA)), ["Semana"]
+    )
+    sa, sb = st.columns(2)
+    with sa:
+        mostrar_dona(
+            dona_top(semana["Semana"], semana["Venta_Neta"], "Venta por día de la semana", n=7, alto=430),
+            "dona_semana_venta",
+        )
+    with sb:
+        mostrar_dona(
+            dona_top(semana["Semana"], semana["Unidades"], "Unidades por día de la semana",
+                     n=7, alto=430, formato=formato_entero),
+            "dona_semana_unidades",
+        )
 
     tabla_dia = ventas_dia.sort_values("Dia", ascending=False)
     st.dataframe(
