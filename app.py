@@ -62,6 +62,9 @@ COLUMNAS_TEXTO = [
     "Lista Utilizada",
 ]
 
+# IVA incluido en "Total Venta" (se usa para estimar la ganancia real).
+IVA = 0.21
+
 # Columnas que se guardan en el histórico (todo lo demás se recalcula al cargar)
 COLUMNAS_GUARDAR = COLUMNAS_REQUERIDAS + COLUMNAS_OPCIONALES + ["_Clave"]
 
@@ -82,6 +85,30 @@ ROJO = "#DC2626"
 NARANJA = "#F59E0B"
 GRIS = "#64748B"
 PALETA = [AZUL, VERDE, NARANJA, "#7C3AED", "#0891B2", ROJO, GRIS]
+
+# Colores fijos por forma de pago: cada una se distingue en todos los gráficos
+COLORES_TIPO_PAGO = {
+    "CONTADO": VERDE,
+    "CUENTA CORRIENTE": AZUL,
+    "OTRO": GRIS,
+}
+COLORES_FORMA_PAGO = {
+    "CONTADO": VERDE,
+    "CUENTA CORRIENTE 7 DIAS": NARANJA,
+    "CUENTA CORRIENTE 10 DIAS": AZUL,
+    "CUENTA CORRIENTE 15 DIAS": "#7C3AED",
+}
+EXTRA_COLORES = ["#0891B2", "#DB2777", "#65A30D", "#92400E", "#0F766E"]
+
+
+def color_pago(nombre, tipo="forma"):
+    mapa = COLORES_FORMA_PAGO if tipo == "forma" else COLORES_TIPO_PAGO
+    nombre = str(nombre).strip().upper()
+    if nombre in mapa:
+        return mapa[nombre]
+    # Forma de pago nueva que no conocemos: color estable según su nombre
+    return EXTRA_COLORES[sum(ord(c) for c in nombre) % len(EXTRA_COLORES)]
+
 
 # Los gráficos no son interactivos con la rueda del mouse, así que
 # al scrollear la página no se mueven ni se achican.
@@ -310,7 +337,7 @@ def clasificar_pago(serie):
     tipo = pd.Series("OTRO", index=serie.index)
     tipo[forma.str.contains("CONTADO", na=False)] = "CONTADO"
     tipo[
-        forma.str.contains(r"CUENTA\s+COR+[EI]NTE|CTA\.?\s*CTE|CTA\.?\s*CORR", regex=True, na=False)
+        forma.str.contains(r"CUENTA\s+COR+I?ENTE|CTA\.?\s*CTE|CTA\.?\s*CORR", regex=True, na=False)
     ] = "CUENTA CORRIENTE"
     return tipo
 
@@ -361,14 +388,24 @@ def enriquecer(df):
         df.loc[mascara, "Total Venta"].abs() / df.loc[mascara, "Cantidad"].abs()
     )
 
-    df["Resultado Venta-Costo $"] = df["Total Venta"] - df["Total Costo"]
+    # "Total Costo" de INFOVENTAS NO es el costo real: es el precio de lista
+    # sin IVA (Total Venta / Total Costo = 1,21). Restarlos da casi solo IVA.
+    # El costo real es Precio Costo x Cantidad. Las notas de crédito y los
+    # renglones "TODO" vienen con Precio Costo = 0 (sin costo conocido) y
+    # no entran en el cálculo de ganancia.
+    df["Con Costo"] = df["Precio Costo"] > 0
+    df["Costo Real"] = df["Precio Costo"] * df["Cantidad Neta"]
+    df["Venta sin IVA"] = df["Total Venta"] / (1 + IVA)
+
+    df["Resultado Venta-Costo $"] = 0.0
+    df.loc[df["Con Costo"], "Resultado Venta-Costo $"] = (
+        df.loc[df["Con Costo"], "Venta sin IVA"] - df.loc[df["Con Costo"], "Costo Real"]
+    )
 
     df["Rentabilidad Real"] = 0.0
-    con_costo = df["Total Costo"] != 0
-    df.loc[con_costo, "Rentabilidad Real"] = (
-        df.loc[con_costo, "Resultado Venta-Costo $"]
-        / df.loc[con_costo, "Total Costo"]
-        * 100
+    cc = df["Costo Real"] != 0
+    df.loc[cc, "Rentabilidad Real"] = (
+        df.loc[cc, "Resultado Venta-Costo $"] / df.loc[cc, "Costo Real"] * 100
     )
 
     df["Dia"] = df["Fecha"].dt.normalize()
@@ -387,15 +424,15 @@ def preparar_datos(df):
 # ============================================================
 
 def rentabilidad_ponderada(df):
-    """Resultado / Costo (igual criterio que la columna Rentabilidad de INFOVENTAS)."""
-    costo = df["Total Costo"].sum()
+    """Ganancia / costo real, ponderada por importes."""
+    costo = df["Costo Real"].sum()
     if costo == 0:
         return 0.0
     return df["Resultado Venta-Costo $"].sum() / costo * 100
 
 
 def margen_sobre_venta(df):
-    venta = df["Total Venta"].sum()
+    venta = df.loc[df["Con Costo"], "Venta sin IVA"].sum()
     if venta == 0:
         return 0.0
     return df["Resultado Venta-Costo $"].sum() / venta * 100
@@ -409,7 +446,7 @@ def resumen_por(df, columnas):
     g_total = df.groupby(columnas, dropna=False)
     base = g_total.agg(
         Venta_Neta=("Total Venta", "sum"),
-        Costo_Neto=("Total Costo", "sum"),
+        Costo_Neto=("Costo Real", "sum"),
         Resultado=("Resultado Venta-Costo $", "sum"),
         Unidades=("Cantidad Neta", "sum"),
         Renglones=("Cantidad", "size"),
@@ -587,14 +624,15 @@ def etiqueta_texto(texto, ancho=40):
     return "<br>".join(lineas)
 
 
-def grafico_barras_horizontal(etiquetas, valores, titulo, formato, color=AZUL, alto_por_barra=58):
+def grafico_barras_horizontal(etiquetas, valores, titulo, formato, color=AZUL, alto_por_barra=58, colores=None):
     valores = list(valores)
     textos = [formato(v) for v in valores]
     n = len(valores)
     maximo = max([abs(v) for v in valores] + [1])
     minimo = min(valores + [0])
 
-    colores = [color if v >= 0 else ROJO for v in valores]
+    if colores is None:
+        colores = [color if v >= 0 else ROJO for v in valores]
 
     fig = go.Figure(
         go.Bar(
@@ -629,14 +667,14 @@ def grafico_barras_horizontal(etiquetas, valores, titulo, formato, color=AZUL, a
     return fig
 
 
-def grafico_dona(etiquetas, valores, titulo):
+def grafico_dona(etiquetas, valores, titulo, colores=None):
     fig = go.Figure(
         go.Pie(
             labels=list(etiquetas),
             values=list(valores),
             hole=0.55,
             sort=False,
-            marker=dict(colors=PALETA, line=dict(color="white", width=2)),
+            marker=dict(colors=colores or PALETA, line=dict(color="white", width=2)),
             textinfo="percent",
             textfont=dict(size=14),
             hovertemplate="<b>%{label}</b><br>%{value:,.2f}<br>%{percent}<extra></extra>",
@@ -788,10 +826,6 @@ def opciones(columna):
     )
 
 
-sucursal = st.sidebar.multiselect("Sucursal", opciones("Suc."))
-if sucursal:
-    df = df[df["Suc."].isin(sucursal)]
-
 tipo_operacion = st.sidebar.multiselect(
     "Tipo de operación",
     ["Venta", "Devolución / Nota de crédito"],
@@ -810,10 +844,6 @@ if tipo_pago:
 forma_pago = st.sidebar.multiselect("Forma de pago exacta", opciones("Forma Pago"))
 if forma_pago:
     df = df[df["Forma Pago"].isin(forma_pago)]
-
-lista = st.sidebar.multiselect("Lista utilizada", opciones("Lista Utilizada"))
-if lista:
-    df = df[df["Lista Utilizada"].isin(lista)]
 
 articulo = st.sidebar.multiselect("Artículo", opciones("Articulo"))
 if articulo:
@@ -863,7 +893,7 @@ c1, c2, c3, c4 = st.columns(4)
 c1.metric("💰 Venta neta", formato_pesos(venta_neta))
 c2.metric("🧾 Ventas brutas", formato_pesos(ventas_brutas))
 c3.metric("🔁 Devoluciones / NC", formato_pesos(devoluciones))
-c4.metric("💵 Resultado (venta - costo)", formato_pesos(resultado_total))
+c4.metric("💵 Ganancia estimada (sin IVA)", formato_pesos(resultado_total))
 
 c5, c6, c7, c8 = st.columns(4)
 c5.metric("📦 Unidades netas", formato_entero(unidades_netas))
@@ -871,11 +901,14 @@ c6.metric("🛒 Ticket promedio", formato_pesos(ticket_promedio))
 c7.metric("📈 Rentabilidad s/costo", formato_porcentaje(rent_ponderada))
 c8.metric("👥 Clientes con compras", formato_entero(clientes_activos))
 
+sin_costo = int((~df["Con Costo"]).sum())
+
 st.caption(
     "Venta neta = ventas brutas menos notas de crédito / devoluciones. "
-    "Rentabilidad s/costo = (venta - costo) / costo, ponderada por importes "
-    "(mismo criterio que la columna de INFOVENTAS, pero sin que los renglones "
-    "de notas de crédito en 0 % distorsionen el promedio)."
+    "Ganancia estimada = venta sin IVA − (Precio Costo × cantidad). "
+    "Rentabilidad s/costo = ganancia / costo, ponderada por importes. "
+    f"{sin_costo} renglones (notas de crédito, artículos 'TODO', etc.) vienen "
+    "sin costo en INFOVENTAS y no entran en la ganancia."
 )
 
 st.divider()
@@ -917,9 +950,9 @@ with tab_resumen:
                 "Artículos distintos",
                 "Precio promedio por unidad",
                 "Ticket promedio",
-                "Resultado (venta - costo)",
+                "Ganancia estimada (sin IVA)",
                 "Rentabilidad s/costo",
-                "Margen s/venta",
+                "Margen s/venta (sin IVA)",
             ],
             "Valor": [
                 formato_pesos(ventas_brutas),
@@ -999,7 +1032,7 @@ with tab_articulos:
             "Unidades netas": ranking_articulos["Unidades"].apply(formato_entero),
             "Venta neta": ranking_articulos["Venta_Neta"].apply(formato_pesos),
             "Devoluciones": ranking_articulos["Devoluciones"].apply(formato_pesos),
-            "Resultado $": ranking_articulos["Resultado"].apply(formato_pesos),
+            "Ganancia $": ranking_articulos["Resultado"].apply(formato_pesos),
             "Rentabilidad": ranking_articulos["Rentabilidad"].apply(formato_porcentaje),
             "Renglones": ranking_articulos["Renglones"],
         }
@@ -1073,7 +1106,7 @@ with tab_clientes:
             "Devoluciones": ranking_clientes["Devoluciones"].apply(formato_pesos),
             "Venta neta": ranking_clientes["Venta_Neta"].apply(formato_pesos),
             "Unidades netas": ranking_clientes["Unidades"].apply(formato_entero),
-            "Resultado $": ranking_clientes["Resultado"].apply(formato_pesos),
+            "Ganancia $": ranking_clientes["Resultado"].apply(formato_pesos),
             "Rentabilidad": ranking_clientes["Rentabilidad"].apply(formato_porcentaje),
             "Estado": ranking_clientes["Estado"],
         }
@@ -1134,6 +1167,7 @@ with tab_pagos:
                 positivos["Tipo Pago"],
                 positivos["Venta_Neta"],
                 "Distribución de la venta neta",
+                colores=[color_pago(t, "tipo") for t in positivos["Tipo Pago"]],
             )
             mostrar_grafico(fig, "grafico_dona_pago")
         else:
@@ -1147,6 +1181,7 @@ with tab_pagos:
             formato_pesos,
             color=AZUL,
             alto_por_barra=90,
+            colores=[color_pago(t, "tipo") for t in ranking_tipo_pago["Tipo Pago"]],
         )
         fig.update_layout(height=400)
         mostrar_grafico(fig, "grafico_barras_pago")
@@ -1173,15 +1208,28 @@ with tab_pagos:
 
     positivas = ranking_forma[ranking_forma["Venta_Neta"] > 0]
     if not positivas.empty:
-        fig = grafico_barras_horizontal(
-            [etiqueta_texto(f) for f in positivas["Forma Pago"]],
-            positivas["Venta_Neta"],
-            "Venta neta por forma de pago",
-            formato_pesos,
-            color=VERDE,
-            alto_por_barra=70,
-        )
-        mostrar_grafico(fig, "grafico_forma_pago")
+        col_c, col_d = st.columns(2)
+
+        with col_c:
+            fig = grafico_dona(
+                positivas["Forma Pago"],
+                positivas["Venta_Neta"],
+                "Distribución por forma de pago",
+                colores=[color_pago(f) for f in positivas["Forma Pago"]],
+            )
+            mostrar_grafico(fig, "grafico_dona_forma_pago")
+
+        with col_d:
+            fig = grafico_barras_horizontal(
+                [etiqueta_texto(f) for f in positivas["Forma Pago"]],
+                positivas["Venta_Neta"],
+                "Venta neta por forma de pago",
+                formato_pesos,
+                alto_por_barra=70,
+                colores=[color_pago(f) for f in positivas["Forma Pago"]],
+            )
+            fig.update_layout(height=400)
+            mostrar_grafico(fig, "grafico_forma_pago")
 
 # ============================================================
 # EVOLUCIÓN
@@ -1250,22 +1298,22 @@ with tab_evolucion:
     mostrar_grafico(fig, "grafico_evolucion_unidades")
 
     por_pago = (
-        resumen_por(df, ["Dia", "Tipo Pago"]).sort_values(["Dia", "Tipo Pago"])
+        resumen_por(df, ["Dia", "Forma Pago"]).sort_values(["Dia", "Forma Pago"])
     )
     fig = go.Figure()
-    for i, tipo in enumerate(sorted(por_pago["Tipo Pago"].unique())):
-        sub = por_pago[por_pago["Tipo Pago"] == tipo]
+    for tipo in sorted(por_pago["Forma Pago"].unique()):
+        sub = por_pago[por_pago["Forma Pago"] == tipo]
         fig.add_trace(
             go.Bar(
                 x=sub["Dia"],
                 y=sub["Venta_Neta"],
                 name=tipo,
-                marker=dict(color=PALETA[i % len(PALETA)]),
+                marker=dict(color=color_pago(tipo)),
                 customdata=[formato_pesos(v) for v in sub["Venta_Neta"]],
                 hovertemplate="%{x|%d/%m/%Y}<br>" + tipo + ": <b>%{customdata}</b><extra></extra>",
             )
         )
-    fig = _layout_base(fig, "Venta neta por día según tipo de pago", 420)
+    fig = _layout_base(fig, "Venta neta por día según forma de pago", 420)
     fig.update_layout(barmode="stack", bargap=0.4)
     fig.update_xaxes(tickformat="%d/%m/%Y", type="date", fixedrange=True)
     fig.update_yaxes(
@@ -1283,7 +1331,7 @@ with tab_evolucion:
                 "Devoluciones": tabla_dia["Devoluciones"].apply(formato_pesos),
                 "Venta neta": tabla_dia["Venta_Neta"].apply(formato_pesos),
                 "Unidades netas": tabla_dia["Unidades"].apply(formato_entero),
-                "Resultado $": tabla_dia["Resultado"].apply(formato_pesos),
+                "Ganancia $": tabla_dia["Resultado"].apply(formato_pesos),
             }
         ),
         use_container_width=True,
@@ -1314,7 +1362,7 @@ with tab_detalle:
             "Forma de pago": detalle["Forma Pago"],
             "Tipo de pago": detalle["Tipo Pago"],
             "Rentabilidad": detalle["Rentabilidad Real"].apply(formato_porcentaje),
-            "Resultado $": detalle["Resultado Venta-Costo $"].apply(formato_pesos),
+            "Ganancia $": detalle["Resultado Venta-Costo $"].apply(formato_pesos),
         }
     )
 
@@ -1338,12 +1386,12 @@ with tab_detalle:
             "Cantidad": detalle["Cantidad Neta"],
             "Cliente": detalle["Cliente"],
             "Precio unitario": detalle["Precio Unitario"],
-            "Total costo": detalle["Total Costo"],
+            "Costo real": detalle["Costo Real"],
             "Total venta": detalle["Total Venta"],
             "Forma de pago": detalle["Forma Pago"],
             "Tipo de pago": detalle["Tipo Pago"],
             "Rentabilidad %": detalle["Rentabilidad Real"].round(2),
-            "Resultado $": detalle["Resultado Venta-Costo $"],
+            "Ganancia $": detalle["Resultado Venta-Costo $"],
         }
     )
 
