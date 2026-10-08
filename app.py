@@ -687,10 +687,16 @@ def grafico_dona(etiquetas, valores, titulo, colores=None, nombres=None,
     vertical = leyenda == "v"
     dominio_x = [0.0, 0.58] if vertical else [0.0, 1.0]
 
+    texto_centro = centro or (
+        f"<b>{formato(total)}</b><br>"
+        "<span style='font-size:11px;color:#64748B'>total</span>"
+    )
+
     fig = go.Figure(
         go.Pie(
             labels=etiquetas,
             values=valores,
+            title=dict(text=texto_centro, position="middle center", font=dict(size=15)),
             hole=0.58,
             sort=False,
             direction="clockwise",
@@ -717,15 +723,6 @@ def grafico_dona(etiquetas, valores, titulo, colores=None, nombres=None,
             legend=dict(orientation="h", y=-0.02, x=0.5, xanchor="center"),
         )
 
-    fig.add_annotation(
-        x=sum(dominio_x) / 2,
-        y=0.5 if vertical else 0.55,
-        xref="paper",
-        yref="paper",
-        text=centro or f"<b>{formato(total)}</b><br><span style='font-size:11px;color:#64748B'>total</span>",
-        showarrow=False,
-        font=dict(size=15),
-    )
     return fig
 
 
