@@ -552,46 +552,100 @@ def cargar_historial():
         return pd.DataFrame()
 
 
+
 def guardar_historial(df):
     if not github_configurado():
         st.error("GitHub no está configurado en los Secrets de Streamlit.")
         return False
 
     try:
-        df_guardar = df[[c for c in COLUMNAS_GUARDAR if c in df.columns]].copy()
+        df_guardar = df[
+            [c for c in COLUMNAS_GUARDAR if c in df.columns]
+        ].copy()
+
         df_guardar = df_guardar.sort_values(
-            "Fecha", ascending=True, na_position="last", kind="stable"
+            "Fecha",
+            ascending=True,
+            na_position="last",
+            kind="stable",
         )
 
         contenido_csv = df_guardar.to_csv(index=False).encode("utf-8")
-        contenido_base64 = base64.b64encode(contenido_csv).decode("utf-8")
+        contenido_base64 = base64.b64encode(
+            contenido_csv
+        ).decode("utf-8")
 
-        respuesta = requests.get(github_url(), headers=github_headers(), timeout=20)
+        url = github_url()
+        headers = github_headers()
 
-        sha = None
-        if respuesta.status_code == 200:
-            sha = respuesta.json().get("sha")
-        elif respuesta.status_code != 404:
-            respuesta.raise_for_status()
-
-        datos = {
+        datos_base = {
             "message": "Actualizar historial de ventas",
             "content": contenido_base64,
             "branch": "main",
         }
-        if sha:
-            datos["sha"] = sha
 
-        respuesta = requests.put(
-            github_url(), headers=github_headers(), json=datos, timeout=60
-        )
-        respuesta.raise_for_status()
+        # Dos intentos como máximo, para resolver conflictos puntuales.
+        for intento in range(2):
+            actual = requests.get(
+                url,
+                headers=headers,
+                params={"ref": "main"},
+                timeout=20,
+            )
 
-        _leer_historial_github.clear()
-        return True
+            if actual.status_code == 200:
+                sha = actual.json().get("sha")
+                if not sha:
+                    st.error(
+                        "GitHub encontró el historial, "
+                        "pero no devolvió su SHA."
+                    )
+                    return False
+
+                datos = {**datos_base, "sha": sha}
+
+            elif actual.status_code == 404:
+                # El archivo no existe: crearlo sin SHA.
+                datos = datos_base.copy()
+
+            else:
+                st.error(
+                    "No se pudo consultar el historial en GitHub. "
+                    f"HTTP {actual.status_code}: {actual.text[:500]}"
+                )
+                return False
+
+            respuesta = requests.put(
+                url,
+                headers=headers,
+                json=datos,
+                timeout=60,
+            )
+
+            if respuesta.status_code in (200, 201):
+                _leer_historial_github.clear()
+                return True
+
+            # Si hubo un conflicto, volver a consultar el SHA
+            # e intentar guardar una sola vez más.
+            if respuesta.status_code == 409 and intento == 0:
+                continue
+
+            st.error(
+                "No se pudo guardar el historial en GitHub. "
+                f"HTTP {respuesta.status_code}: "
+                f"{respuesta.text[:1000]}"
+            )
+            return False
+
+        return False
+
+    except requests.RequestException as e:
+        st.error(f"Error de conexión con GitHub: {e}")
+        return False
 
     except Exception as e:
-        st.error(f"No se pudo guardar el historial en GitHub. Detalle: {e}")
+        st.error(f"No se pudo guardar el historial en GitHub: {e}")
         return False
 
 
