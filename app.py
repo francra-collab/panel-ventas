@@ -509,9 +509,20 @@ def github_url():
 
 
 @st.cache_data(ttl=600, show_spinner=False)
+
+@st.cache_data(ttl=600, show_spinner=False)
 def _leer_historial_github(_firma_config):
-    """Se cachea 10 minutos para no consultar GitHub en cada click."""
-    respuesta = requests.get(github_url(), headers=github_headers(), timeout=20)
+    """Lee el historial desde GitHub."""
+
+    url = github_url()
+    headers = github_headers()
+
+    respuesta = requests.get(
+        url,
+        headers=headers,
+        params={"ref": "main"},
+        timeout=20,
+    )
 
     if respuesta.status_code == 404:
         return pd.DataFrame()
@@ -519,17 +530,42 @@ def _leer_historial_github(_firma_config):
     respuesta.raise_for_status()
     datos = respuesta.json()
 
-    if "content" not in datos:
-        # Archivos de más de 1 MB: GitHub no devuelve el contenido inline
-        descarga = requests.get(
-            datos["download_url"], headers=github_headers(), timeout=30
+    if datos.get("type") != "file":
+        raise ValueError(
+            "La ruta del historial no apunta a un archivo."
         )
-        descarga.raise_for_status()
-        contenido = descarga.content
-    else:
-        contenido = base64.b64decode(datos["content"])
 
-    return pd.read_csv(io.BytesIO(contenido), dtype=str)
+    descarga = requests.get(
+        datos["download_url"],
+        headers=headers,
+        timeout=30,
+    )
+    descarga.raise_for_status()
+    contenido = descarga.content
+
+    if not contenido or not contenido.strip():
+        raise ValueError(
+            "GitHub devolvió un historial vacío. "
+            "El archivo existe, pero no contiene datos."
+        )
+
+    try:
+        df = pd.read_csv(
+            io.BytesIO(contenido),
+            dtype=str,
+            encoding="utf-8-sig",
+        )
+    except pd.errors.EmptyDataError as e:
+        raise ValueError(
+            "GitHub devolvió un CSV sin encabezados ni columnas."
+        ) from e
+
+    if len(df.columns) == 0:
+        raise ValueError(
+            "El histórico no contiene columnas."
+        )
+
+    return df
 
 
 def cargar_historial():
