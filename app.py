@@ -217,47 +217,115 @@ def limpiar_columnas(df):
     return df
 
 
+class ArchivoSinVentas(ValueError):
+    pass
+
+
+def _ubicar_encabezado(crudo):
+    """Busca en las primeras filas la fila de títulos (Fecha, Cod, Total Venta...)."""
+    for i in range(min(40, len(crudo))):
+        fila = [str(x).strip() for x in crudo.iloc[i].tolist()]
+        if "Fecha" in fila and "Total Venta" in fila:
+            return i, fila
+    return None, None
+
+
+def _desde_crudo(crudo):
+    """Convierte una tabla leída sin encabezado en la tabla real de INFOVENTAS."""
+    crudo = crudo.dropna(how="all").reset_index(drop=True)
+    i, fila = _ubicar_encabezado(crudo)
+    if i is None:
+        return None
+    df = crudo.iloc[i + 1:].copy()
+    if df.dropna(how="all").empty:
+        raise ArchivoSinVentas(
+            "El archivo tiene los títulos pero no tiene ninguna venta cargada "
+            "(¿se exportó un día sin movimientos o con el filtro de fechas mal?)."
+        )
+    df.columns = fila
+    df = limpiar_columnas(df)
+    df = df.loc[:, [c for c in df.columns if c not in ("", "nan", "None")]]
+    return df if len(df.columns) > 3 else None
+
+
 def leer_infoventas(archivo):
     """
-    Lee el INFOVENTAS. Aunque se llame .xls, el sistema suele exportar
-    un texto separado por tabulaciones, así que detectamos el formato real.
+    Lee el INFOVENTAS en cualquiera de sus formas:
+    - Texto separado por tabulaciones (aunque se llame .xls).
+    - Excel real (.xlsx o .xls) o tabla HTML disfrazada de .xls.
+    - Con filas de título o en blanco antes de los encabezados.
     """
     contenido = archivo.getvalue()
+    problemas = []
 
-    es_excel_real = contenido[:4] in (b"PK\x03\x04", b"\xd0\xcf\x11\xe0")
+    if len(contenido) == 0:
+        raise ValueError("El archivo está vacío (0 bytes).")
+
+    inicio = contenido[:8]
+    es_excel_real = inicio[:4] in (b"PK\x03\x04", b"\xd0\xcf\x11\xe0")
+    es_html = contenido[:500].lstrip().lower().startswith((b"<html", b"<!doc", b"<table", b"<?xml"))
 
     if es_excel_real:
         for motor in ("openpyxl", "xlrd"):
             try:
-                df = pd.read_excel(
-                    io.BytesIO(contenido),
-                    engine=motor,
-                    dtype=str,
+                crudo = pd.read_excel(
+                    io.BytesIO(contenido), engine=motor, dtype=str, header=None
                 )
-                df = limpiar_columnas(df)
-                if len(df.columns) > 3:
+                df = _desde_crudo(crudo)
+                if df is not None:
                     return df
-            except Exception:
-                pass
-
-    for separador in ("\t", ";", ","):
-        for encoding in ("cp1252", "latin1", "utf-8-sig", "utf-8"):
-            try:
-                df = pd.read_csv(
-                    io.BytesIO(contenido),
-                    sep=separador,
-                    encoding=encoding,
-                    dtype=str,
+                problemas.append(f"Excel leído con {motor} pero no encontré la fila de títulos")
+            except ArchivoSinVentas:
+                raise
+            except ImportError as e:
+                problemas.append(
+                    f"Falta instalar {motor} (agregalo a requirements.txt): {e}"
                 )
-                df = limpiar_columnas(df)
-                if len(df.columns) > 3:
-                    return df
-            except Exception:
-                pass
+            except Exception as e:
+                problemas.append(f"{motor}: {e}")
 
+    if es_html:
+        try:
+            for tabla in pd.read_html(io.BytesIO(contenido), header=None):
+                df = _desde_crudo(tabla.astype(str))
+                if df is not None:
+                    return df
+            problemas.append("Tabla HTML sin la fila de títulos")
+        except ArchivoSinVentas:
+            raise
+        except Exception as e:
+            problemas.append(f"HTML (puede faltar lxml en requirements.txt): {e}")
+
+    if not es_excel_real:
+        for separador in ("\t", ";", ","):
+            for encoding in ("cp1252", "latin1", "utf-8-sig", "utf-8"):
+                try:
+                    crudo = pd.read_csv(
+                        io.BytesIO(contenido),
+                        sep=separador,
+                        encoding=encoding,
+                        dtype=str,
+                        header=None,
+                        names=list(range(60)),
+                        engine="python",
+                        on_bad_lines="skip",
+                        skip_blank_lines=True,
+                    )
+                    df = _desde_crudo(crudo)
+                    if df is not None:
+                        return df
+                except ArchivoSinVentas:
+                    raise
+                except Exception as e:
+                    problemas.append(f"texto ({repr(separador)}, {encoding}): {e}")
+
+    pista = repr(inicio)
+    detalle = "; ".join(dict.fromkeys(problemas))[:600]
     raise ValueError(
-        "No pude reconocer el archivo. "
-        "Probá con el archivo original de INFOVENTAS."
+        "No pude reconocer el archivo: no encuentro la fila de títulos "
+        "(Fecha, Cod, Articulo, ... Total Venta). "
+        f"Tamaño: {len(contenido)} bytes. Empieza con: {pista}. "
+        + (f"Detalle: {detalle}" if detalle else "")
     )
 
 
@@ -509,8 +577,6 @@ def github_url():
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-
-@st.cache_data(ttl=600, show_spinner=False)
 def _leer_historial_github(_firma_config):
     """Lee el historial desde GitHub."""
 
@@ -586,7 +652,6 @@ def cargar_historial():
     except Exception as e:
         st.error(f"No se pudo leer el historial de GitHub. Detalle: {e}")
         return pd.DataFrame()
-
 
 
 def guardar_historial(df):
